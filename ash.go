@@ -1,0 +1,615 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"embed"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/crypto"
+	"maunium.net/go/mautrix/crypto/cryptohelper"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
+)
+
+//go:embed db/schema_meta.sql db/schema_messages.sql
+var schemaFS embed.FS
+
+type MetaSyncStore struct {
+	DB *sql.DB
+}
+
+func (s *MetaSyncStore) LoadNextBatch(ctx context.Context, userID id.UserID) (string, error) {
+	return GetMeta(ctx, s.DB, "sync_token")
+}
+func (s *MetaSyncStore) SaveNextBatch(ctx context.Context, userID id.UserID, token string) error {
+	return SetMeta(ctx, s.DB, "sync_token", token)
+}
+func (s *MetaSyncStore) Close() error { return nil }
+func (s *MetaSyncStore) Name() string { return "MetaSyncStore" }
+
+func (s *MetaSyncStore) LoadFilterID(ctx context.Context, userID id.UserID) (string, error) {
+	return "", nil
+}
+func (s *MetaSyncStore) SaveFilterID(ctx context.Context, userID id.UserID, filterID string) error {
+	return nil
+}
+func (s *MetaSyncStore) LoadPresence(ctx context.Context, userID id.UserID) (interface{}, error) {
+	return nil, nil
+}
+func (s *MetaSyncStore) SavePresence(ctx context.Context, userID id.UserID, presence interface{}) error {
+	return nil
+}
+func (s *MetaSyncStore) LoadAccountData(ctx context.Context, userID id.UserID, eventType string) (json.RawMessage, error) {
+	return nil, nil
+}
+func (s *MetaSyncStore) SaveAccountData(ctx context.Context, userID id.UserID, eventType string, content json.RawMessage) error {
+	return nil
+}
+func (s *MetaSyncStore) LoadRoomAccountData(ctx context.Context, userID id.UserID, roomID id.RoomID, eventType string) (json.RawMessage, error) {
+	return nil, nil
+}
+func (s *MetaSyncStore) SaveRoomAccountData(ctx context.Context, userID id.UserID, roomID id.RoomID, eventType string, content json.RawMessage) error {
+	return nil
+}
+
+type RoomIDEntry struct {
+	ID      string `json:"id"`
+	Comment string `json:"comment"`
+}
+
+type Config struct {
+	Homeserver    string        `json:"MATRIX_HOMESERVER"`
+	User          string        `json:"MATRIX_USER"`
+	Password      string        `json:"MATRIX_PASSWORD"`
+	RecoveryKey   string        `json:"MATRIX_RECOVERY_KEY"`
+	RoomIDs       []RoomIDEntry `json:"MATRIX_ROOM_ID"`
+	DBPath        string        `json:"DB_PATH"`
+	MetaDBPath    string        `json:"META_DB_PATH"`
+	LinksPath     string        `json:"LINKS_JSON_PATH"`
+	SyncTimeoutMS int           `json:"SYNC_TIMEOUT_MS"`
+	Debug         bool          `json:"DEBUG"`
+	DeviceName    string        `json:"MATRIX_DEVICE_NAME"`
+}
+
+// LoadConfig reads and parses the config.json file.
+func LoadConfig() (*Config, error) {
+	var cfg Config
+	jsonFile, err := os.Open("config.json")
+	if err != nil {
+		return nil, fmt.Errorf("open config.json: %w", err)
+	}
+	defer jsonFile.Close()
+	dec := json.NewDecoder(jsonFile)
+	if err := dec.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("decode config.json: %w", err)
+	}
+	return &cfg, nil
+}
+
+func OpenMeta(ctx context.Context, path string) (*sql.DB, error) {
+	return openWithSchema(ctx, path, "db/schema_meta.sql")
+}
+func OpenMessages(ctx context.Context, path string) (*sql.DB, error) {
+	return openWithSchema(ctx, path, "db/schema_messages.sql")
+}
+func openWithSchema(ctx context.Context, path, schemaFile string) (*sql.DB, error) {
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("create db dir: %w", err)
+		}
+	}
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA journal_mode=WAL;"); err != nil {
+		return nil, fmt.Errorf("enable WAL: %w", err)
+	}
+	sqlBytes, err := schemaFS.ReadFile(schemaFile)
+	if err != nil {
+		return nil, fmt.Errorf("read schema: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, string(sqlBytes)); err != nil {
+		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+	return db, nil
+}
+func GetMeta(ctx context.Context, db *sql.DB, key string) (string, error) {
+	var val string
+	if err := db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, key).Scan(&val); err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+	return val, nil
+}
+func SetMeta(ctx context.Context, db *sql.DB, key, value string) error {
+	_, err := db.ExecContext(ctx, `INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
+	return err
+}
+
+type Credentials struct {
+	UserID      string
+	AccessToken string
+	DeviceID    string
+}
+
+func LoadOrCreate(ctx context.Context, database *sql.DB, cfg *Config) (*mautrix.Client, error) {
+	storedCreds, err := loadStored(ctx, database)
+	if err == nil && storedCreds != nil {
+		return createClientFromCreds(cfg.Homeserver, storedCreds)
+	}
+	client, creds, err := loginWithPassword(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := storeCreds(ctx, database, creds); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: couldn't store credentials: %v\n", err)
+	}
+	return client, nil
+}
+func EnsureSecrets(ctx context.Context, database *sql.DB, cfg *Config) error {
+	reader := bufio.NewReader(os.Stdin)
+	type field struct {
+		label   string
+		metaKey string
+		target  *string
+	}
+	fields := []field{
+		{"Homeserver URL", "homeserver", &cfg.Homeserver},
+		{"Matrix user ID", "user_id", &cfg.User},
+		{"Password", "password", &cfg.Password},
+		{"Recovery key (format: EsXX XXXX ...)", "recovery_key", &cfg.RecoveryKey},
+	}
+	for i := range fields {
+		f := &fields[i]
+		if *f.target == "" {
+			if val, err := GetMeta(ctx, database, f.metaKey); err == nil && val != "" {
+				*f.target = val
+				continue
+			}
+		}
+		for *f.target == "" {
+			fmt.Printf("%s: ", f.label)
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return fmt.Errorf("read %s: %w", f.label, err)
+			}
+			*f.target = strings.TrimSpace(line)
+		}
+		if err := SetMeta(ctx, database, f.metaKey, *f.target); err != nil {
+			return fmt.Errorf("save %s: %w", f.label, err)
+		}
+	}
+	return nil
+}
+
+func loadStored(ctx context.Context, database *sql.DB) (*Credentials, error) {
+	userID, _ := GetMeta(ctx, database, "user_id")
+	token, _ := GetMeta(ctx, database, "access_token")
+	deviceID, _ := GetMeta(ctx, database, "device_id")
+	if userID == "" || token == "" || deviceID == "" {
+		return nil, fmt.Errorf("incomplete stored credentials")
+	}
+	return &Credentials{userID, token, deviceID}, nil
+}
+func createClientFromCreds(homeserver string, creds *Credentials) (*mautrix.Client, error) {
+	client, err := mautrix.NewClient(homeserver, id.UserID(creds.UserID), creds.AccessToken)
+	if err != nil {
+		return nil, err
+	}
+	client.DeviceID = id.DeviceID(creds.DeviceID)
+	return client, nil
+}
+func loginWithPassword(ctx context.Context, cfg *Config) (*mautrix.Client, *Credentials, error) {
+	client, err := mautrix.NewClient(cfg.Homeserver, "", "")
+	if err != nil {
+		return nil, nil, err
+	}
+	loginReq := mautrix.ReqLogin{
+		Type:                     "m.login.password",
+		Identifier:               mautrix.UserIdentifier{Type: "m.id.user", User: cfg.User},
+		Password:                 cfg.Password,
+		InitialDeviceDisplayName: cfg.DeviceName,
+		StoreCredentials:         true,
+	}
+	resp, err := client.Login(ctx, &loginReq)
+	if err != nil {
+		return nil, nil, err
+	}
+	client.SetCredentials(resp.UserID, resp.AccessToken)
+	client.DeviceID = resp.DeviceID
+	return client, &Credentials{string(resp.UserID), resp.AccessToken, string(resp.DeviceID)}, nil
+}
+func storeCreds(ctx context.Context, database *sql.DB, creds *Credentials) error {
+	if err := SetMeta(ctx, database, "user_id", creds.UserID); err != nil {
+		return err
+	}
+	if err := SetMeta(ctx, database, "access_token", creds.AccessToken); err != nil {
+		return err
+	}
+	return SetMeta(ctx, database, "device_id", creds.DeviceID)
+}
+
+func EnsurePickleKey(ctx context.Context, metaDB *sql.DB) (string, error) {
+	pickleKey, err := GetMeta(ctx, metaDB, "pickle_key")
+	if err == nil && pickleKey != "" {
+		return pickleKey, nil
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return "", fmt.Errorf("generate pickle key: %w", err)
+	}
+	pickleKey = base64.StdEncoding.EncodeToString(key)
+	if err := SetMeta(ctx, metaDB, "pickle_key", pickleKey); err != nil {
+		return "", fmt.Errorf("save pickle key: %w", err)
+	}
+	return pickleKey, nil
+}
+func SetupHelper(ctx context.Context, client *mautrix.Client, metaDB *sql.DB, metaDBPath string) (*cryptohelper.CryptoHelper, error) {
+	pickleKey, err := GetMeta(ctx, metaDB, "pickle_key")
+	if err != nil {
+		return nil, fmt.Errorf("get pickle key: %w", err)
+	}
+	pickleKeyBytes, err := base64.StdEncoding.DecodeString(pickleKey)
+	if err != nil {
+		return nil, fmt.Errorf("decode pickle key: %w", err)
+	}
+	cryptoDBPath := metaDBPath + ".crypto"
+	helper, err := cryptohelper.NewCryptoHelper(client, pickleKeyBytes, cryptoDBPath)
+	if err != nil {
+		if strings.Contains(err.Error(), "mismatching device ID") {
+			for _, fname := range []string{cryptoDBPath, cryptoDBPath + "-shm", cryptoDBPath + "-wal"} {
+				_ = os.Remove(fname)
+			}
+			helper, err = cryptohelper.NewCryptoHelper(client, pickleKeyBytes, cryptoDBPath)
+			if err != nil {
+				return nil, fmt.Errorf("new crypto helper (after cleanup): %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("new crypto helper: %w", err)
+		}
+	}
+	if err := helper.Init(ctx); err != nil {
+		return nil, fmt.Errorf("init crypto helper: %w", err)
+	}
+	return helper, nil
+}
+func VerifyWithRecoveryKey(ctx context.Context, machine *crypto.OlmMachine, recoveryKey string) error {
+	keyID, keyData, err := machine.SSSS.GetDefaultKeyData(ctx)
+	if err != nil {
+		return fmt.Errorf("get key data: %w", err)
+	}
+	key, err := keyData.VerifyRecoveryKey(keyID, recoveryKey)
+	if err != nil {
+		return fmt.Errorf("verify recovery key: %w", err)
+	}
+	if err := machine.FetchCrossSigningKeysFromSSSS(ctx, key); err != nil {
+		return fmt.Errorf("fetch cross-signing keys: %w", err)
+	}
+	if err := machine.SignOwnDevice(ctx, machine.OwnIdentity()); err != nil {
+		return fmt.Errorf("sign own device: %w", err)
+	}
+	if err := machine.SignOwnMasterKey(ctx); err != nil {
+		return fmt.Errorf("sign own master key: %w", err)
+	}
+	return nil
+}
+
+type MessageData struct {
+	Event *event.Event
+	Msg   *event.MessageEventContent
+	URLs  []string
+}
+
+func ProcessMessageEvent(ev *event.Event) (*MessageData, error) {
+	if ev.Content.Raw != nil {
+		if err := ev.Content.ParseRaw(ev.Type); err != nil {
+			if !strings.Contains(err.Error(), "already parsed") {
+				return nil, err
+			}
+		}
+	}
+	msg := ev.Content.AsMessage()
+	if msg == nil || msg.Body == "" {
+		return nil, nil
+	}
+	urls := ExtractLinks(msg.Body)
+	return &MessageData{
+		Event: ev,
+		Msg:   msg,
+		URLs:  urls,
+	}, nil
+}
+func StoreMessage(database *sql.DB, data *MessageData) error {
+	rawJSON, _ := json.Marshal(data.Event.Content.Raw)
+	_, err := database.Exec(`
+		INSERT OR IGNORE INTO messages(id, room_id, sender, ts_ms, body, msgtype, raw_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?);
+	`, data.Event.ID, data.Event.RoomID, data.Event.Sender, int64(data.Event.Timestamp),
+		data.Msg.Body, data.Msg.MsgType, string(rawJSON))
+	if err != nil {
+		return err
+	}
+	for idx, u := range data.URLs {
+		if _, err := database.Exec(`
+			INSERT OR IGNORE INTO links(message_id, url, idx, title, ts_ms)
+			VALUES (?, ?, ?, NULL, ?);
+		`, data.Event.ID, u, idx, int64(data.Event.Timestamp)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var urlRe = regexp.MustCompile(`(?i)https?://[^\s>]+`)
+
+func ExtractLinks(text string) []string {
+	return urlRe.FindAllString(text, -1)
+}
+
+type LinkRow struct {
+	MessageID string `json:"message_id"`
+	URL       string `json:"url"`
+	TSMillis  int64  `json:"ts_ms"`
+	Sender    string `json:"sender"`
+}
+
+func ExportAllSnapshots(db *sql.DB, rooms []RoomIDEntry, path string) error {
+	// Create a map from roomID to comment
+	roomMap := make(map[string]string)
+	for _, r := range rooms {
+		roomMap[r.ID] = r.Comment
+	}
+	rows, err := db.Query(`
+		SELECT m.room_id, l.message_id, l.url, l.ts_ms, m.sender
+		FROM links l
+		JOIN messages m ON m.id = l.message_id
+		WHERE m.room_id IN (`+strings.Repeat("?,", len(rooms)-1)+`?)
+		ORDER BY m.room_id, l.ts_ms ASC, l.message_id, l.idx;
+	`, func() []interface{} {
+		args := make([]interface{}, len(rooms))
+		for i, r := range rooms {
+			args[i] = r.ID
+		}
+		return args
+	}()...)
+	if err != nil {
+		return fmt.Errorf("query links: %w", err)
+	}
+	defer rows.Close()
+	roomLinks := make(map[string][]LinkRow)
+	for rows.Next() {
+		var roomID string
+		var r LinkRow
+		if err := rows.Scan(&roomID, &r.MessageID, &r.URL, &r.TSMillis, &r.Sender); err != nil {
+			return fmt.Errorf("scan link: %w", err)
+		}
+		comment := roomMap[roomID]
+		roomLinks[comment] = append(roomLinks[comment], r)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	payload := struct {
+		LastSync time.Time            `json:"last_sync"`
+		Rooms    map[string][]LinkRow `json:"rooms"`
+	}{
+		LastSync: time.Now().UTC(),
+		Rooms:    roomLinks,
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("create export file: %w", err)
+	}
+	defer file.Close()
+	enc := json.NewEncoder(file)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(payload); err != nil {
+		return fmt.Errorf("encode export: %w", err)
+	}
+	return nil
+}
+
+// getLogLevel reads the DEBUG flag from config.json to set the log level early
+func getLogLevel() zerolog.Level {
+	cfgPreview := struct {
+		Debug bool `json:"DEBUG"`
+	}{}
+	if f, err := os.Open("config.json"); err == nil {
+		defer f.Close()
+		_ = json.NewDecoder(f).Decode(&cfgPreview)
+		if cfgPreview.Debug {
+			return zerolog.DebugLevel
+		}
+	}
+	return zerolog.InfoLevel
+}
+
+// main initializes the application, loads config, sets up databases, and starts the bot.
+func main() {
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	zerolog.SetGlobalLevel(getLogLevel())
+	log.Debug().Msg("starting")
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	cfg, err := LoadConfig()
+	must(err, "load config")
+	log.Debug().Msg("config loaded")
+	metaDB, err := OpenMeta(ctx, cfg.MetaDBPath)
+	must(err, "open meta db")
+	defer metaDB.Close()
+	must(EnsureSecrets(ctx, metaDB, cfg), "ensure secrets")
+	messagesDB, err := OpenMessages(ctx, cfg.DBPath)
+	must(err, "open messages db")
+	defer messagesDB.Close()
+	_, err = EnsurePickleKey(ctx, metaDB)
+	must(err, "ensure pickle key")
+	must(run(ctx, metaDB, messagesDB, cfg), "run")
+	log.Debug().Msg("exiting")
+}
+
+// run starts the Matrix client, sets up sync, and handles messages.
+func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) error {
+	log.Info().Msgf("logging in as %s to %s (E2EE initializing)", cfg.User, cfg.Homeserver)
+	var roomNames []string
+	for _, r := range cfg.RoomIDs {
+		roomNames = append(roomNames, r.Comment)
+	}
+	log.Info().Msgf("ready: watching rooms: [%s]", strings.Join(roomNames, ", "))
+	client, err := LoadOrCreate(ctx, metaDB, cfg)
+	if err != nil {
+		return err
+	}
+	client.SyncPresence = "offline"
+	syncer := mautrix.NewDefaultSyncer()
+	client.Syncer = syncer
+	client.Store = &MetaSyncStore{DB: metaDB}
+	cryptoHelper, err := SetupHelper(ctx, client, metaDB, cfg.MetaDBPath)
+	if err != nil {
+		return err
+	}
+	client.Crypto = cryptoHelper
+	if err := VerifyWithRecoveryKey(ctx, cryptoHelper.Machine(), cfg.RecoveryKey); err != nil {
+		log.Warn().Err(err).Msg("failed to verify session with recovery key")
+	}
+	readyChan := make(chan bool)
+	var once sync.Once
+	syncCounter := 0
+	syncer.OnSync(func(syncCtx context.Context, resp *mautrix.RespSync, since string) bool {
+		once.Do(func() { close(readyChan) })
+		syncCounter++
+		return true
+	})
+	handleMessage := func(evCtx context.Context, ev *event.Event) {
+		var currentRoom RoomIDEntry
+		if len(cfg.RoomIDs) > 0 {
+			found := false
+			for _, rid := range cfg.RoomIDs {
+				if string(ev.RoomID) == rid.ID {
+					currentRoom = rid
+					found = true
+					break
+				}
+			}
+			if !found {
+				return
+			}
+		}
+		msgData, err := ProcessMessageEvent(ev)
+		if err != nil {
+			log.Warn().Err(err).Str("event_id", string(ev.ID)).Msg("failed to parse event")
+			return
+		}
+		if msgData == nil {
+			return
+		}
+		if err := StoreMessage(messagesDB, msgData); err != nil {
+			log.Error().Err(err).Str("event_id", string(ev.ID)).Msg("store event")
+			return
+		}
+		log.Info().Str("sender", string(ev.Sender)).Str("room", currentRoom.Comment).Msg(truncate(msgData.Msg.Body, 100))
+		if msgData.Msg.Body == "/bot hi" {
+			select {
+			case <-readyChan:
+			case <-evCtx.Done():
+				return
+			}
+			content := event.MessageEventContent{
+				MsgType:   event.MsgText,
+				Body:      "hello",
+				RelatesTo: &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: ev.ID}},
+			}
+			_, err := client.SendMessageEvent(evCtx, ev.RoomID, event.EventMessage, &content)
+			if err != nil {
+				log.Error().Err(err).Msg("failed to send response")
+			} else {
+				log.Info().Msg("sent hello response")
+			}
+			return
+		}
+		if len(msgData.URLs) == 0 {
+			log.Debug().Msg("no links found")
+		} else {
+			log.Info().Int("count", len(msgData.URLs)).Msg("found links:")
+			for _, u := range msgData.URLs {
+				log.Info().Str("url", u).Msg("link")
+			}
+		}
+		if len(msgData.URLs) > 0 {
+			log.Info().Msg("stored to db, exporting snapshot...")
+			if err := ExportAllSnapshots(messagesDB, cfg.RoomIDs, cfg.LinksPath); err != nil {
+				log.Error().Err(err).Msg("export snapshots")
+			} else {
+				log.Info().Str("path", cfg.LinksPath).Msg("exported")
+			}
+		}
+	}
+	syncer.OnEventType(event.EventMessage, handleMessage)
+	syncer.OnEventType(event.EventEncrypted, func(evCtx context.Context, ev *event.Event) {
+		if client.Crypto == nil {
+			return
+		}
+		if ev.Content.Raw != nil {
+			if err := ev.Content.ParseRaw(event.EventEncrypted); err != nil {
+				log.Debug().Err(err).Str("event_id", string(ev.ID)).Msg("failed to parse encrypted event")
+				return
+			}
+		}
+		decrypted, err := client.Crypto.Decrypt(evCtx, ev)
+		if err != nil {
+			log.Debug().Err(err).Str("event_id", string(ev.ID)).Msg("failed to decrypt event")
+			return
+		}
+		handleMessage(evCtx, decrypted)
+	})
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error().Msgf("sync goroutine panic: %v", r)
+			}
+		}()
+		log.Debug().Msg("starting sync")
+		if err := client.Sync(); err != nil && ctx.Err() == nil {
+			log.Error().Err(err).Msg("sync error")
+		}
+	}()
+	select {
+	case <-readyChan:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	<-ctx.Done()
+	log.Debug().Msg("exiting run")
+	return ctx.Err()
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+func must(err error, context string) {
+	if err != nil {
+		log.Fatal().Err(err).Msgf("%s", context)
+	}
+}
