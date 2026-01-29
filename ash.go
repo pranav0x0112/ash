@@ -90,6 +90,7 @@ type Config struct {
 	SyncTimeoutMS int           `json:"SYNC_TIMEOUT_MS"`
 	Debug         bool          `json:"DEBUG"`
 	DeviceName    string        `json:"MATRIX_DEVICE_NAME"`
+	OptOutTag     string        `json:"OPT_OUT_TAG"`
 }
 
 // LoadConfig reads and parses the config.json file.
@@ -626,17 +627,21 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 			for _, u := range msgData.URLs {
 				log.Info().Str("url", u).Msg("link")
 			}
-			blacklist, err := LoadBlacklist("blacklist.json")
-			if err != nil {
-				log.Error().Err(err).Msg("failed to load blacklist")
-			}
-			if currentRoom.Hook != "" {
-				for _, u := range msgData.URLs {
-					if blacklist != nil && IsBlacklisted(u, blacklist) {
-						log.Info().Str("url", u).Msg("skipped blacklisted url")
-						continue
+			if cfg.OptOutTag != "" && strings.Contains(msgData.Msg.Body, cfg.OptOutTag) {
+				log.Info().Str("tag", cfg.OptOutTag).Msg("skipped sending hooks due to opt-out tag")
+			} else {
+				blacklist, err := LoadBlacklist("blacklist.json")
+				if err != nil {
+					log.Error().Err(err).Msg("failed to load blacklist")
+				}
+				if currentRoom.Hook != "" {
+					for _, u := range msgData.URLs {
+						if blacklist != nil && IsBlacklisted(u, blacklist) {
+							log.Info().Str("url", u).Msg("skipped blacklisted url")
+							continue
+						}
+						go sendHook(currentRoom.Hook, u, currentRoom.Key)
 					}
-					go sendHook(currentRoom.Hook, u, currentRoom.Key)
 				}
 			}
 		}
