@@ -72,10 +72,12 @@ func (s *MetaSyncStore) SaveRoomAccountData(ctx context.Context, userID id.UserI
 }
 
 type RoomIDEntry struct {
-	ID      string `json:"id"`
-	Comment string `json:"comment"`
-	Hook    string `json:"hook,omitempty"`
-	Key     string `json:"key,omitempty"`
+	ID        string `json:"id"`
+	Comment   string `json:"comment"`
+	Hook      string `json:"hook,omitempty"`
+	Key       string `json:"key,omitempty"`
+	SendUser  bool   `json:"sendUser,omitempty"`
+	SendTopic bool   `json:"sendTopic,omitempty"`
 }
 
 type Config struct {
@@ -371,8 +373,22 @@ func ExtractLinks(text string) []string {
 	return urlRe.FindAllString(text, -1)
 }
 
-func sendHook(hookURL, link, key string) {
-	payload := map[string]string{"link": link}
+func sendHook(hookURL, link, key, sender, roomID, roomComment string, sendUser, sendTopic bool) {
+	resolvedLink := resolveURL(link)
+	payload := map[string]interface{}{
+		"link": map[string]interface{}{
+			"url": resolvedLink,
+		},
+	}
+	if sendUser {
+		payload["link"].(map[string]interface{})["submittedBy"] = sender
+	}
+	if sendTopic && (roomID != "" || roomComment != "") {
+		payload["room"] = map[string]string{
+			"id":      roomID,
+			"comment": roomComment,
+		}
+	}
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
 		log.Error().Err(err).Str("hook_url", hookURL).Str("link", link).Msg("failed to marshal hook payload")
@@ -399,6 +415,18 @@ func sendHook(hookURL, link, key string) {
 	} else {
 		log.Info().Str("hook_url", hookURL).Str("link", link).Msg("hook sent successfully")
 	}
+}
+
+func resolveURL(url string) string {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	resp, err := client.Head(url)
+	if err != nil {
+		return url
+	}
+	defer resp.Body.Close()
+	return resp.Request.URL.String()
 }
 
 type LinkRow struct {
@@ -640,7 +668,7 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 							log.Info().Str("url", u).Msg("skipped blacklisted url")
 							continue
 						}
-						go sendHook(currentRoom.Hook, u, currentRoom.Key)
+						go sendHook(currentRoom.Hook, u, currentRoom.Key, string(ev.Sender), currentRoom.ID, currentRoom.Comment, currentRoom.SendUser, currentRoom.SendTopic)
 					}
 				}
 			}
