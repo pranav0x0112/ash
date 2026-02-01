@@ -1,0 +1,19 @@
+{
+    "label": "[BOT] ",
+    "commands": {
+        "joke": {
+            "method": "GET",
+            "url": "https://icanhazdadjoke.com/",
+            "headers": {
+                "Accept": "application/json",
+                "User-Agent": "ash-bot (https://github.com/polarhive/ash)"
+            },
+            "json_path": "joke"
+        },
+        "catfact": {
+            "method": "GET",
+            "url": "https://catfact.ninja/fact",
+            "json_path": "fact"
+        }
+    }
+}

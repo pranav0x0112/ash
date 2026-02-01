@@ -72,12 +72,13 @@ func (s *MetaSyncStore) SaveRoomAccountData(ctx context.Context, userID id.UserI
 }
 
 type RoomIDEntry struct {
-	ID        string `json:"id"`
-	Comment   string `json:"comment"`
-	Hook      string `json:"hook,omitempty"`
-	Key       string `json:"key,omitempty"`
-	SendUser  bool   `json:"sendUser,omitempty"`
-	SendTopic bool   `json:"sendTopic,omitempty"`
+	ID         string `json:"id"`
+	Comment    string `json:"comment"`
+	Hook       string `json:"hook,omitempty"`
+	Key        string `json:"key,omitempty"`
+	SendUser   bool   `json:"sendUser,omitempty"`
+	SendTopic  bool   `json:"sendTopic,omitempty"`
+	BotEnabled bool   `json:"botEnabled,omitempty"`
 }
 
 type Config struct {
@@ -89,6 +90,7 @@ type Config struct {
 	DBPath        string        `json:"DB_PATH"`
 	MetaDBPath    string        `json:"META_DB_PATH"`
 	LinksPath     string        `json:"LINKS_JSON_PATH"`
+	BotConfigPath string        `json:"BOT_CONFIG_PATH"`
 	SyncTimeoutMS int           `json:"SYNC_TIMEOUT_MS"`
 	Debug         bool          `json:"DEBUG"`
 	DeviceName    string        `json:"MATRIX_DEVICE_NAME"`
@@ -619,6 +621,17 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 	if err := VerifyWithRecoveryKey(ctx, cryptoHelper.Machine(), cfg.RecoveryKey); err != nil {
 		log.Warn().Err(err).Msg("failed to verify session with recovery key")
 	}
+	// Load bot configuration (optional)
+	botCfgPath := cfg.BotConfigPath
+	if botCfgPath == "" {
+		botCfgPath = "./bot.json"
+	}
+	botCfg, err := LoadBotConfig(botCfgPath)
+	if err != nil {
+		log.Warn().Err(err).Str("path", botCfgPath).Msg("failed to load bot config (continuing without)")
+	} else {
+		log.Info().Str("path", botCfgPath).Msg("loaded bot config")
+	}
 	readyChan := make(chan bool)
 	var once sync.Once
 	syncCounter := 0
@@ -641,6 +654,10 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 			if !found {
 				return
 			}
+			// skip rooms where bot is disabled
+			if !currentRoom.BotEnabled {
+				return
+			}
 		}
 		msgData, err := ProcessMessageEvent(ev)
 		if err != nil {
@@ -655,24 +672,61 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 			return
 		}
 		log.Info().Str("sender", string(ev.Sender)).Str("room", currentRoom.Comment).Msg(truncate(msgData.Msg.Body, 100))
-		if msgData.Msg.Body == "/bot hi" || msgData.Msg.Body == "/bot joke" {
+		if strings.HasPrefix(msgData.Msg.Body, "/bot") {
 			select {
 			case <-readyChan:
 			case <-evCtx.Done():
 				return
 			}
+			parts := strings.Fields(msgData.Msg.Body)
+			cmd := ""
+			if len(parts) >= 2 {
+				cmd = parts[1]
+			}
 			var body string
-			if msgData.Msg.Body == "/bot hi" {
+			if cmd == "" || cmd == "hi" {
 				body = "hello"
 			} else {
-				joke, err := fetchRandomJoke(evCtx)
-				if err != nil {
-					log.Error().Err(err).Msg("failed to fetch joke")
-					body = "sorry, couldn't fetch a joke right now"
+				if botCfg != nil {
+					if cmdCfg, ok := botCfg.Commands[cmd]; ok {
+						resp, err := FetchBotCommand(evCtx, &cmdCfg)
+						if err != nil {
+							log.Error().Err(err).Str("cmd", cmd).Msg("failed to fetch bot command")
+							body = fmt.Sprintf("sorry, couldn't fetch %s right now", cmd)
+						} else {
+							body = resp
+						}
+					} else if cmd == "joke" {
+						joke, err := fetchRandomJoke(evCtx)
+						if err != nil {
+							log.Error().Err(err).Msg("failed to fetch joke")
+							body = "sorry, couldn't fetch a joke right now"
+						} else {
+							body = joke
+						}
+					} else {
+						body = "unknown command"
+					}
 				} else {
-					body = joke
+					// No bot config loaded; fall back to built-in joke
+					if cmd == "joke" {
+						joke, err := fetchRandomJoke(evCtx)
+						if err != nil {
+							log.Error().Err(err).Msg("failed to fetch joke")
+							body = "sorry, couldn't fetch a joke right now"
+						} else {
+							body = joke
+						}
+					} else {
+						body = "unknown command"
+					}
 				}
 			}
+			label := "[BOT] "
+			if botCfg != nil && botCfg.Label != "" {
+				label = botCfg.Label
+			}
+			body = label + body
 			content := event.MessageEventContent{
 				MsgType:   event.MsgText,
 				Body:      body,
@@ -682,11 +736,7 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 			if err != nil {
 				log.Error().Err(err).Msg("failed to send response")
 			} else {
-				if msgData.Msg.Body == "/bot hi" {
-					log.Info().Msg("sent hello response")
-				} else {
-					log.Info().Msg("sent joke response")
-				}
+				log.Info().Str("cmd", cmd).Msg("sent bot response")
 			}
 			return
 		}

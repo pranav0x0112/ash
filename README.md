@@ -2,6 +2,16 @@
 
 > a minimal [matrix] message watcher and link extractor
 
+## Bot commands (bot.json)
+
+You can configure HTTP-backed bot commands in `bot.json`. Example commands included:
+
+- `/bot joke` — uses icanhazdadjoke (returns the `joke` field)
+- `/bot quote` — uses quotable.io (returns the `content` field)
+- `/bot catfact` — uses catfact.ninja (returns the `fact` field)
+
+Add or change commands in `bot.json` and set `BOT_CONFIG_PATH` in `config.json` if you place it elsewhere. The bot will prefix responses using the `label` field (defaults to `[BOT] `).
+
 pairs nicely with [lava](https://polarhive.net/lava)
 
 > lava is a web clipping tool that can run as a server or daemon to automatically populate your Obsidian clippings directory with fresh parsed md from URLs.
