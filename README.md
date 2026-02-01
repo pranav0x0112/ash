@@ -10,7 +10,7 @@ You can configure HTTP-backed bot commands in `bot.json`. Example commands inclu
 - `/bot quote` — uses quotable.io (returns the `content` field)
 - `/bot catfact` — uses catfact.ninja (returns the `fact` field)
 
-Add or change commands in `bot.json` and set `BOT_CONFIG_PATH` in `config.json` if you place it elsewhere. The bot will prefix responses using the `label` field (defaults to `[BOT] `).
+Add or change commands in `bot.json` and set `BOT_CONFIG_PATH` in `config.json` if you place it elsewhere. The bot will prefix responses using `BOT_REPLY_LABEL` in `config.json` (defaults to `> `).
 
 pairs nicely with [lava](https://polarhive.net/lava)
 

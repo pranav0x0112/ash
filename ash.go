@@ -91,6 +91,7 @@ type Config struct {
 	MetaDBPath    string        `json:"META_DB_PATH"`
 	LinksPath     string        `json:"LINKS_JSON_PATH"`
 	BotConfigPath string        `json:"BOT_CONFIG_PATH"`
+	BotReplyLabel string        `json:"BOT_REPLY_LABEL,omitempty"`
 	SyncTimeoutMS int           `json:"SYNC_TIMEOUT_MS"`
 	Debug         bool          `json:"DEBUG"`
 	DeviceName    string        `json:"MATRIX_DEVICE_NAME"`
@@ -722,8 +723,11 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 					}
 				}
 			}
-			label := "[BOT] "
-			if botCfg != nil && botCfg.Label != "" {
+			label := "> "
+			// Precedence: config.BOT_REPLY_LABEL -> bot.json label -> default
+			if cfg != nil && cfg.BotReplyLabel != "" {
+				label = cfg.BotReplyLabel
+			} else if botCfg != nil && botCfg.Label != "" {
 				label = botCfg.Label
 			}
 			body = label + body

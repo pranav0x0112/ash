@@ -19,8 +19,8 @@ deps: ## Install Go dependencies
 	go mod download
 	go mod tidy
 
-build: ## Build the ash single-file binary
-	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go build -o ash ./ash.go
+build: ## Build the ash binary (builds package)
+	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" go build -o ash .
 
 run: build ## Build and run the ash single-file binary
 	./ash
@@ -39,4 +39,5 @@ docker-build: ## Build using Docker for cross-compilation to Ubuntu
 
 ci: docker-build
 	rsync -avzP ash-linux-amd64 'ark:ash/ash-linux-amd64'
+	rsync -avzP *.json 'ark:ash' 
 	ssh ark sudo systemctl restart ash.service

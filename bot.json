@@ -1,5 +1,4 @@
 {
-    "label": "[BOT] ",
     "commands": {
         "joke": {
             "method": "GET",
