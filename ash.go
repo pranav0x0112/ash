@@ -655,10 +655,6 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 			if !found {
 				return
 			}
-			// skip rooms where bot is disabled
-			if !currentRoom.BotEnabled {
-				return
-			}
 		}
 		msgData, err := ProcessMessageEvent(ev)
 		if err != nil {
@@ -673,7 +669,7 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 			return
 		}
 		log.Info().Str("sender", string(ev.Sender)).Str("room", currentRoom.Comment).Msg(truncate(msgData.Msg.Body, 100))
-		if strings.HasPrefix(msgData.Msg.Body, "/bot") {
+		if currentRoom.BotEnabled && strings.HasPrefix(msgData.Msg.Body, "/bot") {
 			select {
 			case <-readyChan:
 			case <-evCtx.Done():
