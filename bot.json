@@ -1,13 +1,13 @@
 {
     "commands": {
         "joke": {
-            "method": "GET",
-            "url": "https://icanhazdadjoke.com/",
-            "headers": {
-                "Accept": "application/json",
-                "User-Agent": "ash-bot (https://github.com/polarhive/ash)"
-            },
-            "json_path": "joke"
+            "handler": "joke",
+            "params": {
+                "url": "https://icanhazdadjoke.com/",
+                "headers": {
+                    "Accept": "application/json"
+                }
+            }
         },
         "catfact": {
             "method": "GET",
@@ -18,6 +18,36 @@
             "method": "GET",
             "url": "https://linkstash.hsp-ec.xyz/api/summary",
             "json_path": "summary"
+        },
+        "quack": {
+            "handler": "quack",
+            "params": {
+                "url": "https://random-d.uk/api/random"
+            }
+        },
+        "meow": {
+            "handler": "meow",
+            "params": {
+                "url": "https://api.thecatapi.com/v1/images/search"
+            }
+        },
+        "deepfry": {
+            "handler": "deepfry",
+            "params": {
+                "imagemagick_args": [
+                    "-modulate",
+                    "100,250,100",
+                    "-contrast-stretch",
+                    "0",
+                    "-statistic",
+                    "NonPeak",
+                    "3",
+                    "-sharpen",
+                    "0x10",
+                    "-implode",
+                    "0.3"
+                ]
+            }
         }
     }
 }

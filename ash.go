@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -95,6 +96,7 @@ type Config struct {
 	LinkstashURL  string        `json:"LINKSTASH_URL,omitempty"`
 	SyncTimeoutMS int           `json:"SYNC_TIMEOUT_MS"`
 	Debug         bool          `json:"DEBUG"`
+	DryRun        bool          `json:"DRY_RUN"`
 	DeviceName    string        `json:"MATRIX_DEVICE_NAME"`
 	OptOutTag     string        `json:"OPT_OUT_TAG"`
 }
@@ -112,6 +114,21 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("decode config.json: %w", err)
 	}
 	return &cfg, nil
+}
+
+// generateHelpMessage creates a help message listing available commands
+func generateHelpMessage(botCfg *BotConfig, allowedCommands []string) string {
+	var cmds []string
+	if len(allowedCommands) > 0 {
+		cmds = make([]string, len(allowedCommands))
+		copy(cmds, allowedCommands)
+	} else {
+		for cmd := range botCfg.Commands {
+			cmds = append(cmds, cmd)
+		}
+	}
+	sort.Strings(cmds)
+	return "Available commands: " + strings.Join(cmds, ", ")
 }
 
 func OpenMeta(ctx context.Context, path string) (*sql.DB, error) {
@@ -433,32 +450,6 @@ func resolveURL(url string) string {
 	return resp.Request.URL.String()
 }
 
-// fetchRandomJoke fetches a random dad joke from icanhazdadjoke.com
-func fetchRandomJoke(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://icanhazdadjoke.com/", nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "ash-bot (https://github.com/polarhive/ash)")
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unexpected status: %d", resp.StatusCode)
-	}
-	var payload struct {
-		Joke string `json:"joke"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return "", err
-	}
-	return payload.Joke, nil
-}
-
 type LinkRow struct {
 	MessageID string `json:"message_id"`
 	URL       string `json:"url"`
@@ -670,6 +661,10 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 			return
 		}
 		log.Info().Str("sender", string(ev.Sender)).Str("room", currentRoom.Comment).Msg(truncate(msgData.Msg.Body, 100))
+		if cfg.DryRun {
+			log.Info().Msg("dry run mode: skipping bot commands and hooks")
+			return
+		}
 		if cfg.BotReplyLabel != "" && strings.Contains(msgData.Msg.Body, cfg.BotReplyLabel) {
 			log.Debug().Str("label", cfg.BotReplyLabel).Msg("skipped bot processing due to bot reply label")
 			return
@@ -692,38 +687,21 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 				body = "command not allowed in this room"
 			} else {
 				if botCfg != nil {
-					if cmdCfg, ok := botCfg.Commands[cmd]; ok {
-						resp, err := FetchBotCommand(evCtx, &cmdCfg, cfg.LinkstashURL)
+					if cmd == "help" {
+						body = generateHelpMessage(botCfg, currentRoom.AllowedCommands)
+					} else if cmdCfg, ok := botCfg.Commands[cmd]; ok {
+						resp, err := FetchBotCommand(evCtx, &cmdCfg, cfg.LinkstashURL, ev, client)
 						if err != nil {
-							log.Error().Err(err).Str("cmd", cmd).Msg("failed to fetch bot command")
-							body = fmt.Sprintf("sorry, couldn't fetch %s right now", cmd)
+							log.Error().Err(err).Str("cmd", cmd).Msg("failed to execute bot command")
+							body = fmt.Sprintf("sorry, couldn't execute %s right now", cmd)
 						} else {
 							body = resp
 						}
-					} else if cmd == "joke" {
-						joke, err := fetchRandomJoke(evCtx)
-						if err != nil {
-							log.Error().Err(err).Msg("failed to fetch joke")
-							body = "sorry, couldn't fetch a joke right now"
-						} else {
-							body = joke
-						}
 					} else {
-						body = "unknown command"
+						body = "Unknown command. " + generateHelpMessage(botCfg, currentRoom.AllowedCommands)
 					}
 				} else {
-					// No bot config loaded; fall back to built-in joke
-					if cmd == "joke" {
-						joke, err := fetchRandomJoke(evCtx)
-						if err != nil {
-							log.Error().Err(err).Msg("failed to fetch joke")
-							body = "sorry, couldn't fetch a joke right now"
-						} else {
-							body = joke
-						}
-					} else {
-						body = "unknown command"
-					}
+					body = "no bot configuration loaded"
 				}
 			}
 			label := "> "

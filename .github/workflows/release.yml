@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build Docker image and extract binary
+      run: |
+        docker build --platform linux/amd64 -t ash .
+        docker run --rm -v $(pwd):/host ash cp /usr/local/bin/ash /host/ash-linux-amd64
+
+    - name: Create release
+      run: |
+        TAG_NAME=${GITHUB_REF#refs/tags/}
+        gh release create "$TAG_NAME" ash-linux-amd64 --generate-notes
+      env:
+        GH_TOKEN: ${{ github.token }}
