@@ -30,6 +30,7 @@ type BotCommand struct {
 	Model        string                 `json:"model,omitempty"`         // Groq model for AI commands
 	MaxTokens    int                    `json:"max_tokens,omitempty"`    // Maximum tokens for AI responses
 	Prompt       string                 `json:"prompt,omitempty"`        // System prompt for AI commands
+	Response     string                 `json:"response,omitempty"`      // Static response text
 	Params       map[string]interface{} `json:"params,omitempty"`        // Additional parameters for handlers
 }
 
@@ -56,6 +57,9 @@ func LoadBotConfig(path string) (*BotConfig, error) {
 
 // FetchBotCommand executes the configured command and returns a string to post.
 func FetchBotCommand(ctx context.Context, c *BotCommand, linkstashURL string, ev *event.Event, matrixClient *mautrix.Client, groqAPIKey string) (string, error) {
+	if c.Response != "" {
+		return c.Response, nil
+	}
 	// Check if this command uses a special handler
 	if c.Handler != "" {
 		switch c.Handler {
@@ -367,7 +371,7 @@ func handleDeepfryCommand(ctx context.Context, ev *event.Event, matrixClient *ma
 	}
 
 	// Apply deepfry effects using ImageMagick
-	// Try magick first (IMv7), fall back to convert (IMv6)
+	// Try different magick approaches for various image formats
 
 	// Get ImageMagick args from params
 	var imagemagickArgs []string
@@ -383,66 +387,18 @@ func handleDeepfryCommand(ctx context.Context, ev *event.Event, matrixClient *ma
 		imagemagickArgs = []string{"-modulate", "100,200,100", "-contrast-stretch", "0", "-statistic", "NonPeak", "3", "-sharpen", "0x5"}
 	}
 
-	// Prepare args for convert (replace -statistic NonPeak 3 with -noise 3)
-	convertArgs := make([]string, len(imagemagickArgs))
-	copy(convertArgs, imagemagickArgs)
-	for i := 0; i < len(convertArgs)-2; i++ {
-		if convertArgs[i] == "-statistic" && convertArgs[i+1] == "NonPeak" && convertArgs[i+2] == "3" {
-			convertArgs = append(convertArgs[:i], append([]string{"-noise", "3"}, convertArgs[i+3:]...)...)
-			break
-		}
-	}
-
 	var execCmd *exec.Cmd
 	var stderr bytes.Buffer
 
-	// Try different approaches to handle various image formats
-	approaches := []func() *exec.Cmd{
-		// Approach 1: Direct magick command
-		func() *exec.Cmd {
-			args := append([]string{inputPath}, imagemagickArgs...)
-			args = append(args, outputFile.Name())
-			return exec.Command("magick", args...)
-		},
-		// Approach 2: Force read as JPEG
-		func() *exec.Cmd {
-			args := append([]string{"JPEG:" + inputPath}, imagemagickArgs...)
-			args = append(args, outputFile.Name())
-			return exec.Command("magick", args...)
-		},
-		// Approach 3: Force read as PNG
-		func() *exec.Cmd {
-			args := append([]string{"PNG:" + inputPath}, imagemagickArgs...)
-			args = append(args, outputFile.Name())
-			return exec.Command("magick", args...)
-		},
-		// Approach 4: Old convert command
-		func() *exec.Cmd {
-			args := append([]string{inputPath}, convertArgs...)
-			args = append(args, outputFile.Name())
-			return exec.Command("convert", args...)
-		},
-	}
+	// Apply deepfry effects using ImageMagick
+	args := append([]string{inputPath}, imagemagickArgs...)
+	args = append(args, outputFile.Name())
+	execCmd = exec.Command("convert", args...)
+	stderr.Reset()
+	execCmd.Stderr = &stderr
 
-	var lastErr error
-	var lastStderr string
-	for _, approach := range approaches {
-		execCmd = approach()
-		stderr.Reset()
-		execCmd.Stderr = &stderr
-
-		if err := execCmd.Run(); err == nil {
-			// Success!
-			break
-		} else {
-			lastErr = err
-			lastStderr = stderr.String()
-			log.Debug().Err(err).Str("stderr", lastStderr).Msg("conversion approach failed, trying next")
-		}
-	}
-
-	if lastErr != nil {
-		return "", fmt.Errorf("failed to run ImageMagick with all approaches: %w, last stderr: %s", lastErr, lastStderr)
+	if err := execCmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to run ImageMagick: %w, stderr: %s", err, stderr.String())
 	}
 
 	// Read the processed image

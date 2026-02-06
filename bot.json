@@ -1,5 +1,8 @@
 {
     "commands": {
+        "hi": {
+            "response": "hello"
+        },
         "joke": {
             "handler": "joke",
             "params": {
@@ -20,7 +23,7 @@
             "handler": "summary",
             "model": "openai/gpt-oss-120b",
             "max_tokens": 8192,
-            "prompt": "Provide a short 2-line summary of what these articles are about, focusing on the main topics and key insights. Use *text* for bold formatting in WhatsApp style."
+            "prompt": "Provide a short 2-line summary of what these articles are about, focusing on the main topics and key insights. using WhatsApp-style markdown formatting (*bold*, _italic_, ~strikethrough~, ```code```). Do not use emojis, double asterisk for bold **** only use single, no md ## headings or tables. Be helpful, truthful, and engaging."
         },
         "quack": {
             "handler": "quack",
@@ -56,7 +59,7 @@
             "handler": "gork",
             "model": "openai/gpt-oss-120b",
             "max_tokens": 8192,
-            "prompt": "Respond as an AI assistant using WhatsApp-style markdown formatting (*bold*, _italic_, ~strikethrough~, ```code```). Be helpful, truthful, and engaging."
+            "prompt": "Respond as an AI assistant using WhatsApp-style markdown formatting (*bold*, _italic_, ~strikethrough~, ```code```). Do not use emojis, double asterisk for bold **** only use single, no md ## headings or tables. Be helpful, truthful, and engaging."
         }
     }
 }

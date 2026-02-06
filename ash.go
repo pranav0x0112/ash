@@ -670,21 +670,26 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 			log.Debug().Str("label", cfg.BotReplyLabel).Msg("skipped bot processing due to bot reply label")
 			return
 		}
-		if currentRoom.AllowedCommands != nil && strings.HasPrefix(msgData.Msg.Body, "/bot") {
+		if currentRoom.AllowedCommands != nil && (strings.HasPrefix(msgData.Msg.Body, "/bot") || strings.HasPrefix(msgData.Msg.Body, "@gork")) {
 			select {
 			case <-readyChan:
 			case <-evCtx.Done():
 				return
 			}
-			parts := strings.Fields(msgData.Msg.Body)
+			normalizedBody := msgData.Msg.Body
+			if strings.HasPrefix(msgData.Msg.Body, "@gork") {
+				normalizedBody = "/bot gork " + strings.TrimSpace(strings.TrimPrefix(msgData.Msg.Body, "@gork"))
+			}
+			parts := strings.Fields(normalizedBody)
 			cmd := ""
 			if len(parts) >= 2 {
 				cmd = parts[1]
 			}
-			var body string
 			if cmd == "" || cmd == "hi" {
-				body = "hello"
-			} else if len(currentRoom.AllowedCommands) > 0 && !inSlice(currentRoom.AllowedCommands, cmd) {
+				cmd = "hi"
+			}
+			var body string
+			if len(currentRoom.AllowedCommands) > 0 && !inSlice(currentRoom.AllowedCommands, cmd) && cmd != "hi" {
 				body = "command not allowed in this room"
 			} else {
 				if botCfg != nil {
