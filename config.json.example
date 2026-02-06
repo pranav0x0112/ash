@@ -16,6 +16,7 @@
     ],
     "BOT_REPLY_LABEL": "[BOT] ",
     "LINKSTASH_URL": "https://linkstash.your-domain.tld",
+    "GROQ_API_KEY": "your-groq-api-key-here",
     "MATRIX_DEVICE_NAME": "ash",
     "META_DB_PATH": "./data/meta.db",
     "DB_PATH": "./data/messages.db",

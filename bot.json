@@ -15,9 +15,12 @@
             "json_path": "fact"
         },
         "summary": {
-            "method": "GET",
             "url": "https://linkstash.hsp-ec.xyz/api/summary",
-            "json_path": "summary"
+            "json_path": "summary",
+            "handler": "summary",
+            "model": "openai/gpt-oss-120b",
+            "max_tokens": 8192,
+            "prompt": "Provide a short 2-line summary of what these articles are about, focusing on the main topics and key insights. Use *text* for bold formatting in WhatsApp style."
         },
         "quack": {
             "handler": "quack",
@@ -48,6 +51,12 @@
                     "0.3"
                 ]
             }
+        },
+        "gork": {
+            "handler": "gork",
+            "model": "openai/gpt-oss-120b",
+            "max_tokens": 8192,
+            "prompt": "Respond as an AI assistant using WhatsApp-style markdown formatting (*bold*, _italic_, ~strikethrough~, ```code```). Be helpful, truthful, and engaging."
         }
     }
 }

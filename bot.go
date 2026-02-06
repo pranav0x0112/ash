@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/sashabaranov/go-openai"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
@@ -26,6 +27,9 @@ type BotCommand struct {
 	JSONPath     string                 `json:"json_path,omitempty"`
 	ResponseType string                 `json:"response_type,omitempty"` // "text", "json", or "image" (optional)
 	Handler      string                 `json:"handler,omitempty"`       // "http", "quack", "meow", "deepfry", "joke" (optional)
+	Model        string                 `json:"model,omitempty"`         // Groq model for AI commands
+	MaxTokens    int                    `json:"max_tokens,omitempty"`    // Maximum tokens for AI responses
+	Prompt       string                 `json:"prompt,omitempty"`        // System prompt for AI commands
 	Params       map[string]interface{} `json:"params,omitempty"`        // Additional parameters for handlers
 }
 
@@ -51,7 +55,7 @@ func LoadBotConfig(path string) (*BotConfig, error) {
 }
 
 // FetchBotCommand executes the configured command and returns a string to post.
-func FetchBotCommand(ctx context.Context, c *BotCommand, linkstashURL string, ev *event.Event, matrixClient *mautrix.Client) (string, error) {
+func FetchBotCommand(ctx context.Context, c *BotCommand, linkstashURL string, ev *event.Event, matrixClient *mautrix.Client, groqAPIKey string) (string, error) {
 	// Check if this command uses a special handler
 	if c.Handler != "" {
 		switch c.Handler {
@@ -63,6 +67,10 @@ func FetchBotCommand(ctx context.Context, c *BotCommand, linkstashURL string, ev
 			return handleDeepfryCommand(ctx, ev, matrixClient, c)
 		case "joke":
 			return handleJokeCommand(ctx, c)
+		case "summary":
+			return handleSummaryCommand(ctx, ev, c, groqAPIKey)
+		case "gork":
+			return handleGorkCommand(ctx, ev, matrixClient, c, groqAPIKey)
 		default:
 			return "", fmt.Errorf("unknown handler: %s", c.Handler)
 		}
@@ -467,179 +475,217 @@ func handleDeepfryCommand(ctx context.Context, ev *event.Event, matrixClient *ma
 
 // handleQuackCommand fetches a random duck image from random-d.uk API
 func handleQuackCommand(ctx context.Context, ev *event.Event, matrixClient *mautrix.Client, cmd *BotCommand) (string, error) {
-	url := "https://random-d.uk/api/random" // default
-	if cmd.Params != nil {
-		if u, ok := cmd.Params["url"].(string); ok {
-			url = u
+	// Process image asynchronously
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error().Interface("panic", r).Msg("panic in quack command goroutine")
+			}
+		}()
+
+		url := "https://random-d.uk/api/random" // default
+		if cmd.Params != nil {
+			if u, ok := cmd.Params["url"].(string); ok {
+				url = u
+			}
 		}
-	}
-	// Fetch random duck image URL from API
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("User-Agent", "ash-bot (https://github.com/polarhive/ash)")
+		// Fetch random duck image URL from API
+		req, err := http.NewRequestWithContext(context.Background(), "GET", url, nil)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to create duck API request")
+			return
+		}
+		req.Header.Set("User-Agent", "ash-bot (https://github.com/polarhive/ash)")
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch duck API: %w", err)
-	}
-	defer resp.Body.Close()
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to fetch duck API")
+			return
+		}
+		defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("duck API returned status %d", resp.StatusCode)
-	}
+		if resp.StatusCode != http.StatusOK {
+			log.Warn().Int("status", resp.StatusCode).Msg("duck API returned bad status")
+			return
+		}
 
-	// Parse JSON response
-	var apiResp struct {
-		Message string `json:"message"`
-		URL     string `json:"url"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return "", fmt.Errorf("failed to parse API response: %w", err)
-	}
+		// Parse JSON response
+		var apiResp struct {
+			Message string `json:"message"`
+			URL     string `json:"url"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+			log.Warn().Err(err).Msg("failed to parse duck API response")
+			return
+		}
 
-	if apiResp.URL == "" {
-		return "", fmt.Errorf("no image URL in API response")
-	}
+		if apiResp.URL == "" {
+			log.Warn().Msg("no image URL in duck API response")
+			return
+		}
 
-	log.Info().Str("image_url", apiResp.URL).Msg("fetched duck image URL")
+		log.Info().Str("image_url", apiResp.URL).Msg("fetched duck image URL")
 
-	// Download the image
-	imageResp, err := http.Get(apiResp.URL)
-	if err != nil {
-		return "", fmt.Errorf("failed to download image: %w", err)
-	}
-	defer imageResp.Body.Close()
+		// Download the image
+		imageResp, err := http.Get(apiResp.URL)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to download duck image")
+			return
+		}
+		defer imageResp.Body.Close()
 
-	if imageResp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("image download failed with status %d", imageResp.StatusCode)
-	}
+		if imageResp.StatusCode != http.StatusOK {
+			log.Warn().Int("status", imageResp.StatusCode).Msg("duck image download failed")
+			return
+		}
 
-	imageData, err := io.ReadAll(imageResp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read image data: %w", err)
-	}
+		imageData, err := io.ReadAll(imageResp.Body)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to read duck image data")
+			return
+		}
 
-	log.Info().Int("size", len(imageData)).Msg("downloaded duck image")
+		log.Info().Int("size", len(imageData)).Msg("downloaded duck image")
 
-	// Determine content type
-	contentType := imageResp.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "image/jpeg" // default fallback
-	}
+		// Determine content type
+		contentType := imageResp.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = "image/jpeg" // default fallback
+		}
 
-	// Upload the image to Matrix
-	uploadResp, err := matrixClient.UploadBytes(ctx, imageData, contentType)
-	if err != nil {
-		return "", fmt.Errorf("failed to upload image: %w", err)
-	}
+		// Upload the image to Matrix
+		uploadResp, err := matrixClient.UploadBytes(context.Background(), imageData, contentType)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to upload duck image")
+			return
+		}
 
-	// Send the image as a reply
-	imageContent := event.MessageEventContent{
-		MsgType:   event.MsgImage,
-		Body:      "quack.jpg",
-		URL:       uploadResp.ContentURI.CUString(),
-		RelatesTo: &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: ev.ID}},
-	}
+		// Send the image as a reply
+		imageContent := event.MessageEventContent{
+			MsgType:   event.MsgImage,
+			Body:      "quack.jpg",
+			URL:       uploadResp.ContentURI.CUString(),
+			RelatesTo: &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: ev.ID}},
+		}
 
-	_, err = matrixClient.SendMessageEvent(ctx, ev.RoomID, event.EventMessage, &imageContent)
-	if err != nil {
-		return "", fmt.Errorf("failed to send image: %w", err)
-	}
+		_, err = matrixClient.SendMessageEvent(context.Background(), ev.RoomID, event.EventMessage, &imageContent)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to send duck image")
+			return
+		}
+	}()
 
-	return "🦆 Quack!", nil
+	return "", nil
 }
 
 // handleMeowCommand fetches a random cat image from The Cat API
 func handleMeowCommand(ctx context.Context, ev *event.Event, matrixClient *mautrix.Client, cmd *BotCommand) (string, error) {
-	url := "https://api.thecatapi.com/v1/images/search" // default
-	if cmd.Params != nil {
-		if u, ok := cmd.Params["url"].(string); ok {
-			url = u
+	// Process image asynchronously
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error().Interface("panic", r).Msg("panic in meow command goroutine")
+			}
+		}()
+
+		url := "https://api.thecatapi.com/v1/images/search" // default
+		if cmd.Params != nil {
+			if u, ok := cmd.Params["url"].(string); ok {
+				url = u
+			}
 		}
-	}
-	// Fetch random cat image from The Cat API
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("User-Agent", "ash-bot (https://github.com/polarhive/ash)")
+		// Fetch random cat image from The Cat API
+		req, err := http.NewRequestWithContext(context.Background(), "GET", url, nil)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to create cat API request")
+			return
+		}
+		req.Header.Set("User-Agent", "ash-bot (https://github.com/polarhive/ash)")
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch cat API: %w", err)
-	}
-	defer resp.Body.Close()
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to fetch cat API")
+			return
+		}
+		defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("cat API returned status %d", resp.StatusCode)
-	}
+		if resp.StatusCode != http.StatusOK {
+			log.Warn().Int("status", resp.StatusCode).Msg("cat API returned bad status")
+			return
+		}
 
-	// Parse JSON response - API returns an array of cat objects
-	var apiResp []struct {
-		ID     string `json:"id"`
-		URL    string `json:"url"`
-		Width  int    `json:"width"`
-		Height int    `json:"height"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
-		return "", fmt.Errorf("failed to parse API response: %w", err)
-	}
+		// Parse JSON response - API returns an array of cat objects
+		var apiResp []struct {
+			ID     string `json:"id"`
+			URL    string `json:"url"`
+			Width  int    `json:"width"`
+			Height int    `json:"height"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+			log.Warn().Err(err).Msg("failed to parse cat API response")
+			return
+		}
 
-	if len(apiResp) == 0 || apiResp[0].URL == "" {
-		return "", fmt.Errorf("no image URL in API response")
-	}
+		if len(apiResp) == 0 || apiResp[0].URL == "" {
+			log.Warn().Msg("no image URL in cat API response")
+			return
+		}
 
-	imageURL := apiResp[0].URL
-	log.Info().Str("image_url", imageURL).Str("cat_id", apiResp[0].ID).Msg("fetched cat image")
+		imageURL := apiResp[0].URL
+		log.Info().Str("image_url", imageURL).Str("cat_id", apiResp[0].ID).Msg("fetched cat image")
 
-	// Download the image
-	imageResp, err := http.Get(imageURL)
-	if err != nil {
-		return "", fmt.Errorf("failed to download image: %w", err)
-	}
-	defer imageResp.Body.Close()
+		// Download the image
+		imageResp, err := http.Get(imageURL)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to download cat image")
+			return
+		}
+		defer imageResp.Body.Close()
 
-	if imageResp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("image download failed with status %d", imageResp.StatusCode)
-	}
+		if imageResp.StatusCode != http.StatusOK {
+			log.Warn().Int("status", imageResp.StatusCode).Msg("cat image download failed")
+			return
+		}
 
-	imageData, err := io.ReadAll(imageResp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read image data: %w", err)
-	}
+		imageData, err := io.ReadAll(imageResp.Body)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to read cat image data")
+			return
+		}
 
-	log.Info().Int("size", len(imageData)).Msg("downloaded cat image")
+		log.Info().Int("size", len(imageData)).Msg("downloaded cat image")
 
-	// Determine content type
-	contentType := imageResp.Header.Get("Content-Type")
-	if contentType == "" {
-		contentType = "image/jpeg" // default fallback
-	}
+		// Determine content type
+		contentType := imageResp.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = "image/jpeg" // default fallback
+		}
 
-	// Upload the image to Matrix
-	uploadResp, err := matrixClient.UploadBytes(ctx, imageData, contentType)
-	if err != nil {
-		return "", fmt.Errorf("failed to upload image: %w", err)
-	}
+		// Upload the image to Matrix
+		uploadResp, err := matrixClient.UploadBytes(context.Background(), imageData, contentType)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to upload cat image")
+			return
+		}
 
-	// Send the image as a reply
-	imageContent := event.MessageEventContent{
-		MsgType:   event.MsgImage,
-		Body:      "meow.jpg",
-		URL:       uploadResp.ContentURI.CUString(),
-		RelatesTo: &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: ev.ID}},
-	}
+		// Send the image as a reply
+		imageContent := event.MessageEventContent{
+			MsgType:   event.MsgImage,
+			Body:      "meow.jpg",
+			URL:       uploadResp.ContentURI.CUString(),
+			RelatesTo: &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: ev.ID}},
+		}
 
-	_, err = matrixClient.SendMessageEvent(ctx, ev.RoomID, event.EventMessage, &imageContent)
-	if err != nil {
-		return "", fmt.Errorf("failed to send image: %w", err)
-	}
+		_, err = matrixClient.SendMessageEvent(context.Background(), ev.RoomID, event.EventMessage, &imageContent)
+		if err != nil {
+			log.Warn().Err(err).Msg("failed to send cat image")
+			return
+		}
+	}()
 
-	return "🐱 Meow!", nil
+	return "", nil
 }
 
 // handleJokeCommand fetches a random joke from configured API
@@ -682,4 +728,263 @@ func handleJokeCommand(ctx context.Context, cmd *BotCommand) (string, error) {
 		return "", err
 	}
 	return payload.Joke, nil
+}
+
+// handleSummaryCommand summarizes the articles from linkstash using Groq
+func handleSummaryCommand(ctx context.Context, ev *event.Event, cmd *BotCommand, groqAPIKey string) (string, error) {
+	// First, fetch the summary JSON
+	url := "https://linkstash.hsp-ec.xyz/api/summary"
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "ash-bot (https://github.com/polarhive/ash)")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+	var data struct {
+		Summary []struct {
+			ID    string `json:"id"`
+			Title string `json:"title"`
+			URL   string `json:"url"`
+		} `json:"summary"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return "", err
+	}
+
+	if len(data.Summary) == 0 {
+		return "No articles to summarize.", nil
+	}
+
+	// Fetch content for each article
+	var contents []string
+	for _, article := range data.Summary {
+		contentURL := fmt.Sprintf("https://linkstash.hsp-ec.xyz/api/content/%s", article.ID)
+		req, err := http.NewRequestWithContext(ctx, "GET", contentURL, nil)
+		if err != nil {
+			log.Warn().Err(err).Str("id", article.ID).Msg("failed to create request for content")
+			continue
+		}
+		req.Header.Set("User-Agent", "ash-bot (https://github.com/polarhive/ash)")
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Warn().Err(err).Str("id", article.ID).Msg("failed to fetch content")
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			log.Warn().Err(err).Str("id", article.ID).Msg("failed to read content")
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			log.Warn().Int("status", resp.StatusCode).Str("id", article.ID).Msg("bad status for content")
+			continue
+		}
+		contents = append(contents, string(body))
+	}
+
+	if len(contents) == 0 {
+		return "Failed to fetch any article contents.", nil
+	}
+
+	// Combine all contents
+	combined := strings.Join(contents, "\n\n---\n\n")
+
+	// Estimate tokens (rough approximation: 1 token ≈ 4 characters)
+	estimatedTokens := len(combined) / 4
+	tokenLimit := 6000 // Leave some buffer below the 8000 limit
+
+	if estimatedTokens > tokenLimit {
+		// Truncate content to fit within token limit
+		maxChars := tokenLimit * 4
+		if len(combined) > maxChars {
+			combined = combined[:maxChars]
+			// Try to cut at a reasonable boundary
+			if lastNewline := strings.LastIndex(combined, "\n"); lastNewline > maxChars/2 {
+				combined = combined[:lastNewline]
+			}
+		}
+		log.Warn().Int("original_tokens", estimatedTokens).Int("truncated_tokens", len(combined)/4).Msg("truncated content to fit token limit")
+	}
+
+	// Prepare prompt
+	prompt := cmd.Prompt
+	if prompt == "" {
+		prompt = "Provide a short 2-line summary of what these articles are about, focusing on the main topics and key insights:" // fallback
+	}
+	prompt += "\n\n" + combined
+
+	// Use Groq API
+	if groqAPIKey == "" {
+		return "", fmt.Errorf("GROQ_API_KEY not set")
+	}
+
+	config := openai.DefaultConfig(groqAPIKey)
+	config.BaseURL = "https://api.groq.com/openai/v1"
+	groqClient := openai.NewClientWithConfig(config)
+
+	model := cmd.Model
+	if model == "" {
+		model = "openai/gpt-oss-120b" // default fallback
+	}
+
+	maxTokens := cmd.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = 600 // default fallback
+	}
+
+	groqResp, err := groqClient.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		Model: model,
+		Messages: []openai.ChatCompletionMessage{
+			{Role: "user", Content: prompt},
+		},
+		MaxTokens: maxTokens,
+	})
+	if err != nil {
+		return "", fmt.Errorf("groq api: %w", err)
+	}
+
+	if len(groqResp.Choices) == 0 {
+		return "", fmt.Errorf("no response from groq")
+	}
+
+	response := groqResp.Choices[0].Message.Content
+	return response + "\n\nRead more: https://linkstash.hsp-ec.xyz/", nil
+}
+
+// handleGorkCommand responds to a message using Groq
+func handleGorkCommand(ctx context.Context, ev *event.Event, matrixClient *mautrix.Client, cmd *BotCommand, groqAPIKey string) (string, error) {
+	// Get the message content
+	if ev.Content.Raw != nil {
+		if err := ev.Content.ParseRaw(ev.Type); err != nil {
+			if !strings.Contains(err.Error(), "already parsed") {
+				return "", fmt.Errorf("failed to parse event: %w", err)
+			}
+		}
+	}
+
+	msg := ev.Content.AsMessage()
+	if msg == nil {
+		return "", fmt.Errorf("not a message event")
+	}
+
+	messageText := msg.Body
+	if messageText == "" {
+		return "No message to respond to.", nil
+	}
+
+	// Check if this is a reply and get the original message
+	var originalMessageText string
+	if msg.RelatesTo != nil && msg.RelatesTo.InReplyTo != nil {
+		// This is a reply, fetch the original message
+		originalEvent, err := matrixClient.GetEvent(ctx, ev.RoomID, msg.RelatesTo.InReplyTo.EventID)
+		if err != nil {
+			log.Warn().Err(err).Str("event_id", string(msg.RelatesTo.InReplyTo.EventID)).Msg("failed to fetch replied-to message")
+			// Continue without original message
+		} else {
+			// Parse the original event content
+			if originalEvent.Content.Raw != nil {
+				if err := originalEvent.Content.ParseRaw(originalEvent.Type); err != nil {
+					log.Warn().Err(err).Msg("failed to parse original event")
+				} else {
+					// Decrypt the event if it's encrypted
+					if originalEvent.Type == event.EventEncrypted && matrixClient.Crypto != nil {
+						log.Debug().Str("event_id", string(originalEvent.ID)).Msg("decrypting replied-to encrypted event")
+						decryptedEvent, err := matrixClient.Crypto.Decrypt(ctx, originalEvent)
+						if err != nil {
+							log.Warn().Err(err).Msg("failed to decrypt replied-to message")
+						} else {
+							originalEvent = decryptedEvent
+							log.Debug().Str("event_id", string(originalEvent.ID)).Msg("successfully decrypted replied-to event")
+						}
+					}
+
+					originalMsg := originalEvent.Content.AsMessage()
+					if originalMsg != nil {
+						originalMessageText = originalMsg.Body
+					}
+				}
+			}
+		}
+	}
+
+	// Remove the command prefix if present
+	targetText := strings.TrimSpace(strings.TrimPrefix(messageText, "/bot gork"))
+
+	if targetText == "" && originalMessageText == "" {
+		return "Please provide a message to respond to.", nil
+	}
+
+	// Estimate tokens and truncate if necessary
+	estimatedTokens := len(targetText) / 4
+	tokenLimit := 2000 // Conservative limit for gork responses
+
+	if estimatedTokens > tokenLimit {
+		maxChars := tokenLimit * 4
+		targetText = targetText[:maxChars]
+		// Try to cut at word boundary
+		if lastSpace := strings.LastIndex(targetText, " "); lastSpace > maxChars/2 {
+			targetText = targetText[:lastSpace]
+		}
+		log.Warn().Int("original_tokens", estimatedTokens).Int("truncated_tokens", len(targetText)/4).Msg("truncated message to fit token limit")
+	}
+
+	// Prepare prompt
+	basePrompt := cmd.Prompt
+	if basePrompt == "" {
+		basePrompt = "Respond as an AI assistant in plain text without any markdown formatting. Be helpful, truthful, and engaging." // fallback
+	}
+
+	var prompt string
+	if originalMessageText != "" {
+		// This is a reply to another message
+		prompt = fmt.Sprintf("%s\n\nThe user is asking about this message: \"%s\"\n\nTheir question/comment: %s", basePrompt, originalMessageText, targetText)
+	} else {
+		// Direct message
+		prompt = fmt.Sprintf("%s\n\n%s", basePrompt, targetText)
+	}
+
+	// Use Groq API
+	if groqAPIKey == "" {
+		return "", fmt.Errorf("GROQ_API_KEY not set")
+	}
+
+	config := openai.DefaultConfig(groqAPIKey)
+	config.BaseURL = "https://api.groq.com/openai/v1"
+	groqClient := openai.NewClientWithConfig(config)
+
+	model := cmd.Model
+	if model == "" {
+		model = "openai/gpt-oss-120b" // default fallback
+	}
+
+	maxTokens := cmd.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = 300 // default fallback
+	}
+
+	groqResp, err := groqClient.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		Model: model,
+		Messages: []openai.ChatCompletionMessage{
+			{Role: "user", Content: prompt},
+		},
+		MaxTokens: maxTokens,
+	})
+	if err != nil {
+		return "", fmt.Errorf("groq api: %w", err)
+	}
+
+	if len(groqResp.Choices) == 0 {
+		return "", fmt.Errorf("no response from groq")
+	}
+
+	return groqResp.Choices[0].Message.Content, nil
 }

@@ -94,6 +94,7 @@ type Config struct {
 	BotConfigPath string        `json:"BOT_CONFIG_PATH"`
 	BotReplyLabel string        `json:"BOT_REPLY_LABEL,omitempty"`
 	LinkstashURL  string        `json:"LINKSTASH_URL,omitempty"`
+	GroqAPIKey    string        `json:"GROQ_API_KEY,omitempty"`
 	SyncTimeoutMS int           `json:"SYNC_TIMEOUT_MS"`
 	Debug         bool          `json:"DEBUG"`
 	DryRun        bool          `json:"DRY_RUN"`
@@ -690,12 +691,15 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 					if cmd == "help" {
 						body = generateHelpMessage(botCfg, currentRoom.AllowedCommands)
 					} else if cmdCfg, ok := botCfg.Commands[cmd]; ok {
-						resp, err := FetchBotCommand(evCtx, &cmdCfg, cfg.LinkstashURL, ev, client)
+						resp, err := FetchBotCommand(evCtx, &cmdCfg, cfg.LinkstashURL, ev, client, cfg.GroqAPIKey)
 						if err != nil {
 							log.Error().Err(err).Str("cmd", cmd).Msg("failed to execute bot command")
 							body = fmt.Sprintf("sorry, couldn't execute %s right now", cmd)
-						} else {
+						} else if resp != "" {
 							body = resp
+						} else {
+							// Command sent its own message (like images), don't send a text reply
+							return
 						}
 					} else {
 						body = "Unknown command. " + generateHelpMessage(botCfg, currentRoom.AllowedCommands)
