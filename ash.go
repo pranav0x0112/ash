@@ -425,7 +425,7 @@ func sendHook(hookURL, link, key, sender, roomID, roomComment string, sendUser, 
 	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
-	client := &http.Client{}
+	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Error().Err(err).Str("hook_url", hookURL).Str("link", link).Msg("failed to send hook")
@@ -661,16 +661,16 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 			log.Error().Err(err).Str("event_id", string(ev.ID)).Msg("store event")
 			return
 		}
-		log.Info().Str("sender", string(ev.Sender)).Str("room", currentRoom.Comment).Msg(truncate(msgData.Msg.Body, 100))
-		if cfg.DryRun {
-			log.Info().Msg("dry run mode: skipping bot commands and hooks")
-			return
-		}
+		log.Info().Str("room", currentRoom.Comment).Str("sender", string(ev.Sender)).Msg(truncate(msgData.Msg.Body, 100))
 		if cfg.BotReplyLabel != "" && strings.Contains(msgData.Msg.Body, cfg.BotReplyLabel) {
 			log.Debug().Str("label", cfg.BotReplyLabel).Msg("skipped bot processing due to bot reply label")
 			return
 		}
 		if currentRoom.AllowedCommands != nil && (strings.HasPrefix(msgData.Msg.Body, "/bot") || strings.HasPrefix(msgData.Msg.Body, "@gork")) {
+			if cfg.DryRun {
+				log.Info().Msg("dry run mode: skipping bot command")
+				return
+			}
 			select {
 			case <-readyChan:
 			case <-evCtx.Done():
@@ -696,16 +696,40 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 					if cmd == "help" {
 						body = generateHelpMessage(botCfg, currentRoom.AllowedCommands)
 					} else if cmdCfg, ok := botCfg.Commands[cmd]; ok {
-						resp, err := FetchBotCommand(evCtx, &cmdCfg, cfg.LinkstashURL, ev, client, cfg.GroqAPIKey)
-						if err != nil {
-							log.Error().Err(err).Str("cmd", cmd).Msg("failed to execute bot command")
-							body = fmt.Sprintf("sorry, couldn't execute %s right now", cmd)
-						} else if resp != "" {
-							body = resp
-						} else {
-							// Command sent its own message (like images), don't send a text reply
-							return
-						}
+						// Run bot command in a goroutine to avoid blocking other messages
+						go func() {
+							resp, err := FetchBotCommand(evCtx, &cmdCfg, cfg.LinkstashURL, ev, client, cfg.GroqAPIKey)
+							var body string
+							if err != nil {
+								log.Error().Err(err).Str("cmd", cmd).Msg("failed to execute bot command")
+								body = fmt.Sprintf("sorry, couldn't execute %s right now", cmd)
+							} else if resp != "" {
+								body = resp
+							} else {
+								// Command sent its own message (like images), don't send a text reply
+								return
+							}
+							label := "> "
+							// Precedence: config.BOT_REPLY_LABEL -> bot.json label -> default
+							if cfg != nil && cfg.BotReplyLabel != "" {
+								label = cfg.BotReplyLabel
+							} else if botCfg != nil && botCfg.Label != "" {
+								label = botCfg.Label
+							}
+							body = label + body
+							content := event.MessageEventContent{
+								MsgType:   event.MsgText,
+								Body:      body,
+								RelatesTo: &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: ev.ID}},
+							}
+							_, err = client.SendMessageEvent(evCtx, ev.RoomID, event.EventMessage, &content)
+							if err != nil {
+								log.Error().Err(err).Msg("failed to send response")
+							} else {
+								log.Info().Str("cmd", cmd).Msg("sent bot response")
+							}
+						}()
+						return // Don't send a response here, it's handled in the goroutine
 					} else {
 						body = "Unknown command. " + generateHelpMessage(botCfg, currentRoom.AllowedCommands)
 					}
@@ -744,17 +768,21 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 			if cfg.OptOutTag != "" && strings.Contains(msgData.Msg.Body, cfg.OptOutTag) {
 				log.Info().Str("tag", cfg.OptOutTag).Msg("skipped sending hooks due to opt-out tag")
 			} else {
-				blacklist, err := LoadBlacklist("blacklist.json")
-				if err != nil {
-					log.Error().Err(err).Msg("failed to load blacklist")
-				}
-				if currentRoom.Hook != "" {
-					for _, u := range msgData.URLs {
-						if blacklist != nil && IsBlacklisted(u, blacklist) {
-							log.Info().Str("url", u).Msg("skipped blacklisted url")
-							continue
+				if cfg.DryRun {
+					log.Info().Msg("dry run mode: skipping hooks")
+				} else {
+					blacklist, err := LoadBlacklist("blacklist.json")
+					if err != nil {
+						log.Error().Err(err).Msg("failed to load blacklist")
+					}
+					if currentRoom.Hook != "" {
+						for _, u := range msgData.URLs {
+							if blacklist != nil && IsBlacklisted(u, blacklist) {
+								log.Info().Str("url", u).Msg("skipped blacklisted url")
+								continue
+							}
+							go sendHook(currentRoom.Hook, u, currentRoom.Key, string(ev.Sender), currentRoom.ID, currentRoom.Comment, currentRoom.SendUser, currentRoom.SendTopic)
 						}
-						go sendHook(currentRoom.Hook, u, currentRoom.Key, string(ev.Sender), currentRoom.ID, currentRoom.Comment, currentRoom.SendUser, currentRoom.SendTopic)
 					}
 				}
 			}
@@ -769,23 +797,6 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 		}
 	}
 	syncer.OnEventType(event.EventMessage, handleMessage)
-	syncer.OnEventType(event.EventEncrypted, func(evCtx context.Context, ev *event.Event) {
-		if client.Crypto == nil {
-			return
-		}
-		if ev.Content.Raw != nil {
-			if err := ev.Content.ParseRaw(event.EventEncrypted); err != nil {
-				log.Debug().Err(err).Str("event_id", string(ev.ID)).Msg("failed to parse encrypted event")
-				return
-			}
-		}
-		decrypted, err := client.Crypto.Decrypt(evCtx, ev)
-		if err != nil {
-			log.Debug().Err(err).Str("event_id", string(ev.ID)).Msg("failed to decrypt event")
-			return
-		}
-		handleMessage(evCtx, decrypted)
-	})
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {

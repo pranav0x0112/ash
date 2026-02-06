@@ -1,7 +1,5 @@
-# Single-stage Dockerfile to build and run the Go application on Ubuntu with Olm support
-
 # Use official Golang image (Ubuntu-based) with Olm dev libraries for static linking
-FROM golang:latest
+FROM golang:latest AS builder
 
 # Install build tools and Olm development libraries
 RUN apt-get update && apt-get install -y \
@@ -18,18 +16,20 @@ WORKDIR /app
 
 # Copy go mod files first for better caching
 COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
-# Download dependencies (cached if go.mod/go.sum unchanged)
-RUN go mod download
-
-# Copy source code
 COPY . .
 
-# Build the application
-RUN go build -v -o ash .
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    go build -v -o ash .
 
-# Copy the binary to /usr/local/bin
-RUN cp ash /usr/local/bin/ash && chmod +x /usr/local/bin/ash
+# ---- runtime image ----
+FROM ubuntu:latest
 
-# Set the default command
-CMD ["/usr/local/bin/ash"]
+RUN apt-get update && apt-get install -y libolm3
+
+COPY --from=builder /app/ash /usr/local/bin/ash
+
+CMD ["ash"]

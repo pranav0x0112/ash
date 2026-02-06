@@ -19,6 +19,14 @@ import (
 	"maunium.net/go/mautrix/id"
 )
 
+const (
+	defaultContentType = "image/jpeg"
+	tempInputPrefix    = "exec_input_*.tmp"
+	tempDeepfryInput   = "deepfry_input_*.tmp"
+	tempDeepfryOutput  = "deepfry_output_*.jpg"
+	tempExecOutput     = "exec_output_*"
+)
+
 // BotCommand describes a bot command that can return text or images
 type BotCommand struct {
 	Type         string                 `json:"type"` // "http", "exec", "ai"
@@ -59,6 +67,139 @@ func LoadBotConfig(path string) (*BotConfig, error) {
 	return &bc, nil
 }
 
+// sendImageToMatrix uploads and sends an image to Matrix
+func sendImageToMatrix(ctx context.Context, matrixClient *mautrix.Client, roomID id.RoomID, eventID id.EventID, imageData []byte, contentType, body string) error {
+	uploadResp, err := matrixClient.UploadBytes(ctx, imageData, contentType)
+	if err != nil {
+		return fmt.Errorf("failed to upload image: %w", err)
+	}
+
+	imageContent := event.MessageEventContent{
+		MsgType:   event.MsgImage,
+		Body:      body,
+		URL:       uploadResp.ContentURI.CUString(),
+		RelatesTo: &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: eventID}},
+	}
+
+	_, err = matrixClient.SendMessageEvent(ctx, roomID, event.EventMessage, &imageContent)
+	if err != nil {
+		return fmt.Errorf("failed to send image: %w", err)
+	}
+	return nil
+}
+
+// downloadImageFromMessage extracts the image from a message or its replied-to message
+func downloadImageFromMessage(ctx context.Context, matrixClient *mautrix.Client, ev *event.Event) (*event.MessageEventContent, error) {
+	// Parse the message content
+	if ev.Content.Raw != nil {
+		if err := ev.Content.ParseRaw(ev.Type); err != nil {
+			if !strings.Contains(err.Error(), "already parsed") {
+				return nil, fmt.Errorf("failed to parse event: %w", err)
+			}
+		}
+	}
+
+	msg := ev.Content.AsMessage()
+	if msg == nil {
+		return nil, fmt.Errorf("not a message event")
+	}
+
+	var imageMsg *event.MessageEventContent
+
+	// Check if this message itself has an image
+	if msg.MsgType == event.MsgImage || msg.MsgType == "m.sticker" || msg.URL != "" || msg.File != nil {
+		imageMsg = msg
+	} else if msg.RelatesTo != nil && msg.RelatesTo.InReplyTo != nil {
+		// This is a reply, fetch the original message
+		originalEvent, err := matrixClient.GetEvent(ctx, ev.RoomID, msg.RelatesTo.InReplyTo.EventID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch replied-to message: %w", err)
+		}
+
+		// Parse the original event content
+		if originalEvent.Content.Raw != nil {
+			if err := originalEvent.Content.ParseRaw(originalEvent.Type); err != nil {
+				return nil, fmt.Errorf("failed to parse original event: %w", err)
+			}
+		}
+
+		// Decrypt if encrypted
+		if originalEvent.Type == event.EventEncrypted && matrixClient.Crypto != nil {
+			log.Debug().Str("event_id", string(originalEvent.ID)).Msg("decrypting replied-to encrypted event")
+			decryptedEvent, err := matrixClient.Crypto.Decrypt(ctx, originalEvent)
+			if err != nil {
+				return nil, fmt.Errorf("failed to decrypt replied-to message: %w", err)
+			}
+			originalEvent = decryptedEvent
+		}
+
+		originalMsg := originalEvent.Content.AsMessage()
+		if originalMsg != nil && (originalMsg.MsgType == event.MsgImage || originalMsg.MsgType == "m.sticker" || originalMsg.URL != "" || originalMsg.File != nil) {
+			imageMsg = originalMsg
+		}
+	}
+
+	if imageMsg == nil {
+		return nil, fmt.Errorf("no image found")
+	}
+
+	return imageMsg, nil
+}
+
+// downloadImageBytes downloads image from URL, handling encryption if needed
+func downloadImageBytes(ctx context.Context, matrixClient *mautrix.Client, mediaURL id.ContentURIString, encryptedFile *event.EncryptedFileInfo) ([]byte, error) {
+	if mediaURL == "" {
+		return nil, fmt.Errorf("no media URL")
+	}
+
+	parsedURL, err := id.ParseContentURI(string(mediaURL))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse media URL: %w", err)
+	}
+
+	data, err := matrixClient.DownloadBytes(ctx, parsedURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to download image: %w", err)
+	}
+
+	// If this was from an encrypted file, decrypt it
+	if encryptedFile != nil {
+		err = encryptedFile.PrepareForDecryption()
+		if err != nil {
+			return nil, fmt.Errorf("failed to prepare for decryption: %w", err)
+		}
+		data, err = encryptedFile.Decrypt(data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt image: %w", err)
+		}
+	}
+
+	return data, nil
+}
+
+// detectImageExtension detects file type and returns appropriate extension
+func detectImageExtension(inputPath string) string {
+	fileCmd := exec.Command("file", inputPath)
+	fileOutput, err := fileCmd.Output()
+	if err != nil {
+		return ".png" // default
+	}
+
+	typeStr := strings.ToLower(strings.TrimSpace(string(fileOutput)))
+	switch {
+	case strings.Contains(typeStr, "jpeg") || strings.Contains(typeStr, "jpg"):
+		return ".jpg"
+	case strings.Contains(typeStr, "png"):
+		return ".png"
+	case strings.Contains(typeStr, "gif"):
+		return ".gif"
+	case strings.Contains(typeStr, "webp") || strings.Contains(typeStr, "web/p"):
+		return ".webp"
+	default:
+		return ".png"
+	}
+}
+
 // FetchBotCommand executes the configured command and returns a string to post.
 func FetchBotCommand(ctx context.Context, c *BotCommand, linkstashURL string, ev *event.Event, matrixClient *mautrix.Client, groqAPIKey string) (string, error) {
 	if c.Response != "" {
@@ -89,10 +230,6 @@ func handleHttpCommand(ctx context.Context, c *BotCommand, linkstashURL string, 
 	}
 	for k, v := range c.Headers {
 		req.Header.Set(k, v)
-	}
-	// Default User-Agent
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", "ash-bot (https://github.com/polarhive/ash)")
 	}
 	client := &http.Client{Timeout: 8 * time.Second}
 	resp, err := client.Do(req)
@@ -141,7 +278,7 @@ func handleHttpCommand(ctx context.Context, c *BotCommand, linkstashURL string, 
 					}
 					contentType := imageResp.Header.Get("Content-Type")
 					if contentType == "" {
-						contentType = "image/jpeg"
+						contentType = defaultContentType
 					}
 					uploadResp, err := matrixClient.UploadBytes(context.Background(), imageData, contentType)
 					if err != nil {
@@ -182,6 +319,8 @@ func handleHttpCommand(ctx context.Context, c *BotCommand, linkstashURL string, 
 // handleExecCommand handles executable commands
 func handleExecCommand(ctx context.Context, ev *event.Event, matrixClient *mautrix.Client, c *BotCommand) (string, error) {
 	var inputPath string
+	// Track temporary files for cleanup across the whole function
+	var tmpFiles []string
 	if c.InputType == "image" {
 		// Copy image download logic from handleDeepfryCommand
 		// Parse the message content
@@ -282,6 +421,13 @@ func handleExecCommand(ctx context.Context, ev *event.Event, matrixClient *mautr
 		if err != nil {
 			return "", fmt.Errorf("failed to create temp input file: %w", err)
 		}
+		// Track temporary files for cleanup
+		tmpFiles = append(tmpFiles, inputFile.Name())
+		defer func() {
+			for _, f := range tmpFiles {
+				_ = os.Remove(f)
+			}
+		}()
 
 		if _, err := inputFile.Write(data); err != nil {
 			return "", fmt.Errorf("failed to write image data: %w", err)
@@ -304,8 +450,13 @@ func handleExecCommand(ctx context.Context, ev *event.Event, matrixClient *mautr
 				ext = ".png"
 			}
 			newName := strings.TrimSuffix(inputFile.Name(), ".tmp") + ext
-			os.Rename(inputFile.Name(), newName)
-			inputPath = newName
+			if err := os.Rename(inputFile.Name(), newName); err != nil {
+				// keep original name if rename fails
+				inputPath = inputFile.Name()
+			} else {
+				inputPath = newName
+				tmpFiles = append(tmpFiles, newName)
+			}
 		} else {
 			inputPath = inputFile.Name()
 		}
@@ -325,12 +476,14 @@ func handleExecCommand(ctx context.Context, ev *event.Event, matrixClient *mautr
 			outputPath = outputFile.Name()
 			args[i] = outputPath
 			outputFile.Close()
+			// track output file for cleanup
+			tmpFiles = append(tmpFiles, outputPath)
 		} else {
 			args[i] = arg
 		}
 	}
 
-	// Run command
+	// Run the command
 	cmd := exec.Command(c.Command, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -347,7 +500,7 @@ func handleExecCommand(ctx context.Context, ev *event.Event, matrixClient *mautr
 			return "", fmt.Errorf("failed to read processed image: %w", err)
 		}
 
-		uploadResp, err := matrixClient.UploadBytes(ctx, processedData, "image/jpeg")
+		uploadResp, err := matrixClient.UploadBytes(ctx, processedData, defaultContentType)
 		if err != nil {
 			return "", fmt.Errorf("failed to upload processed image: %w", err)
 		}
@@ -364,7 +517,7 @@ func handleExecCommand(ctx context.Context, ev *event.Event, matrixClient *mautr
 			return "", fmt.Errorf("failed to send processed image: %w", err)
 		}
 
-		return "Image processed!", nil
+		return "", nil
 	} else {
 		return strings.TrimSpace(stdout.String()), nil
 	}
@@ -373,6 +526,8 @@ func handleExecCommand(ctx context.Context, ev *event.Event, matrixClient *mautr
 // handleAiCommand handles AI-based commands using Groq
 func handleAiCommand(ctx context.Context, ev *event.Event, matrixClient *mautrix.Client, c *BotCommand, groqAPIKey string) (string, error) {
 	var targetText string
+	// Track replied-to event ID if present so we can reply to the original
+	var originalEventID id.EventID
 
 	if strings.Contains(c.Prompt, "articles") {
 		// Special for summary: fetch articles from linkstash
@@ -452,7 +607,7 @@ func handleAiCommand(ctx context.Context, ev *event.Event, matrixClient *mautrix
 			}
 		}
 	} else {
-		// For gork: use message text
+		// For gork: use message text. If this is a reply to another message, prefer the replied-to message as the prompt
 		if ev.Content.Raw != nil {
 			if err := ev.Content.ParseRaw(ev.Type); err != nil {
 				if !strings.Contains(err.Error(), "already parsed") {
@@ -471,8 +626,67 @@ func handleAiCommand(ctx context.Context, ev *event.Event, matrixClient *mautrix
 			return "No message to respond to.", nil
 		}
 
-		// Remove the command prefix
-		targetText = strings.TrimSpace(strings.TrimPrefix(messageText, "/bot "+strings.Split(ev.Content.AsMessage().Body, " ")[0]))
+		var originalMessageText string
+		if msg.RelatesTo != nil && msg.RelatesTo.InReplyTo != nil {
+			oe, err := matrixClient.GetEvent(ctx, ev.RoomID, msg.RelatesTo.InReplyTo.EventID)
+			if err != nil {
+				log.Warn().Err(err).Str("event_id", string(msg.RelatesTo.InReplyTo.EventID)).Msg("failed to fetch replied-to message")
+			} else {
+				if oe.Content.Raw != nil {
+					if err := oe.Content.ParseRaw(oe.Type); err != nil {
+						log.Warn().Err(err).Msg("failed to parse original event")
+					} else {
+						if oe.Type == event.EventEncrypted && matrixClient.Crypto != nil {
+							log.Debug().Str("event_id", string(oe.ID)).Msg("decrypting replied-to encrypted event")
+							decrypted, err := matrixClient.Crypto.Decrypt(ctx, oe)
+							if err != nil {
+								log.Warn().Err(err).Msg("failed to decrypt replied-to message")
+							} else {
+								oe = decrypted
+								log.Debug().Str("event_id", string(oe.ID)).Msg("successfully decrypted replied-to event")
+							}
+						}
+						if om := oe.Content.AsMessage(); om != nil {
+							originalEventID = oe.ID
+							originalMessageText = om.Body
+						}
+					}
+				}
+			}
+		}
+
+		if originalMessageText != "" {
+			// Use the replied-to message as the prompt and append the follow-up from the command message.
+			// e.g. originalMessageText="1+1=3", messageText="@gork is this true?" -> "respond to: 1+1=3, is this true?"
+			userSuffix := strings.TrimSpace(messageText)
+			// Strip common command prefixes
+			userSuffix = strings.TrimPrefix(userSuffix, "/bot gork")
+			userSuffix = strings.TrimPrefix(userSuffix, "/bot gork ")
+			userSuffix = strings.TrimPrefix(userSuffix, "/bot")
+			// strip @gork mention (case-insensitive)
+			if strings.HasPrefix(strings.ToLower(userSuffix), "@gork") {
+				userSuffix = strings.TrimSpace(userSuffix[len("@gork"):])
+			}
+			userSuffix = strings.TrimSpace(userSuffix)
+			// Remove leading punctuation from suffix
+			userSuffix = strings.TrimLeft(userSuffix, ":, ")
+			if userSuffix != "" {
+				// Combine into a single prompt
+				targetText = fmt.Sprintf("respond to: %s, %s", strings.TrimSpace(originalMessageText), userSuffix)
+			} else {
+				targetText = fmt.Sprintf("respond to: %s", strings.TrimSpace(originalMessageText))
+			}
+		} else {
+			// Remove the command prefix (e.g. "/bot gork ")
+			parts := strings.Fields(messageText)
+			if len(parts) >= 2 {
+				targetText = strings.TrimSpace(strings.TrimPrefix(messageText, parts[0]+" "+parts[1]))
+			} else if len(parts) == 1 {
+				targetText = strings.TrimSpace(strings.TrimPrefix(messageText, parts[0]))
+			} else {
+				targetText = strings.TrimSpace(messageText)
+			}
+		}
 
 		// Estimate tokens and truncate if necessary
 		estimatedTokens := len(targetText) / 4
@@ -523,7 +737,23 @@ func handleAiCommand(ctx context.Context, ev *event.Event, matrixClient *mautrix
 		return "", fmt.Errorf("no response from groq")
 	}
 
-	return groqResp.Choices[0].Message.Content, nil
+	response := groqResp.Choices[0].Message.Content
+	// If we fetched a replied-to event earlier, send the response directly as a reply to that event
+	if originalEventID != "" {
+		content := event.MessageEventContent{
+			MsgType:   event.MsgText,
+			Body:      response,
+			RelatesTo: &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: originalEventID}},
+		}
+		_, err := matrixClient.SendMessageEvent(ctx, ev.RoomID, event.EventMessage, &content)
+		if err != nil {
+			return "", fmt.Errorf("failed to send response to replied-to message: %w", err)
+		}
+		// Indicate that we've already replied
+		return "", nil
+	}
+
+	return response, nil
 }
 
 // Very small helper to extract keys separated by '.' from a parsed JSON value.
@@ -843,7 +1073,6 @@ func handleQuackCommand(ctx context.Context, ev *event.Event, matrixClient *maut
 			log.Warn().Err(err).Msg("failed to create duck API request")
 			return
 		}
-		req.Header.Set("User-Agent", "ash-bot (https://github.com/polarhive/ash)")
 
 		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Do(req)
@@ -953,7 +1182,6 @@ func handleMeowCommand(ctx context.Context, ev *event.Event, matrixClient *mautr
 			log.Warn().Err(err).Msg("failed to create cat API request")
 			return
 		}
-		req.Header.Set("User-Agent", "ash-bot (https://github.com/polarhive/ash)")
 
 		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Do(req)
@@ -1012,7 +1240,7 @@ func handleMeowCommand(ctx context.Context, ev *event.Event, matrixClient *mautr
 		// Determine content type
 		contentType := imageResp.Header.Get("Content-Type")
 		if contentType == "" {
-			contentType = "image/jpeg" // default fallback
+			contentType = defaultContentType // default fallback
 		}
 
 		// Upload the image to Matrix
@@ -1066,7 +1294,6 @@ func handleJokeCommand(ctx context.Context, cmd *BotCommand) (string, error) {
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	req.Header.Set("User-Agent", "ash-bot (https://github.com/polarhive/ash)")
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1093,7 +1320,6 @@ func handleSummaryCommand(ctx context.Context, ev *event.Event, cmd *BotCommand,
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", "ash-bot (https://github.com/polarhive/ash)")
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1127,7 +1353,6 @@ func handleSummaryCommand(ctx context.Context, ev *event.Event, cmd *BotCommand,
 			log.Warn().Err(err).Str("id", article.ID).Msg("failed to create request for content")
 			continue
 		}
-		req.Header.Set("User-Agent", "ash-bot (https://github.com/polarhive/ash)")
 		resp, err := client.Do(req)
 		if err != nil {
 			log.Warn().Err(err).Str("id", article.ID).Msg("failed to fetch content")
@@ -1217,6 +1442,8 @@ func handleSummaryCommand(ctx context.Context, ev *event.Event, cmd *BotCommand,
 
 // handleGorkCommand responds to a message using Groq
 func handleGorkCommand(ctx context.Context, ev *event.Event, matrixClient *mautrix.Client, cmd *BotCommand, groqAPIKey string) (string, error) {
+	log.Debug().Msg("handleGorkCommand started")
+
 	// Get the message content
 	if ev.Content.Raw != nil {
 		if err := ev.Content.ParseRaw(ev.Type); err != nil {
@@ -1236,15 +1463,19 @@ func handleGorkCommand(ctx context.Context, ev *event.Event, matrixClient *mautr
 		return "No message to respond to.", nil
 	}
 
+	log.Debug().Str("messageText", messageText).Interface("relatesTo", msg.RelatesTo).Msg("gork message parsed")
+
 	// Check if this is a reply and get the original message
 	var originalMessageText string
 	if msg.RelatesTo != nil && msg.RelatesTo.InReplyTo != nil {
+		log.Debug().Str("replyToEventID", string(msg.RelatesTo.InReplyTo.EventID)).Msg("this is a reply, fetching original")
 		// This is a reply, fetch the original message
 		originalEvent, err := matrixClient.GetEvent(ctx, ev.RoomID, msg.RelatesTo.InReplyTo.EventID)
 		if err != nil {
 			log.Warn().Err(err).Str("event_id", string(msg.RelatesTo.InReplyTo.EventID)).Msg("failed to fetch replied-to message")
 			// Continue without original message
 		} else {
+			log.Debug().Msg("original event fetched, parsing...")
 			// Parse the original event content
 			if originalEvent.Content.Raw != nil {
 				if err := originalEvent.Content.ParseRaw(originalEvent.Type); err != nil {
@@ -1265,10 +1496,13 @@ func handleGorkCommand(ctx context.Context, ev *event.Event, matrixClient *mautr
 					originalMsg := originalEvent.Content.AsMessage()
 					if originalMsg != nil {
 						originalMessageText = originalMsg.Body
+						log.Debug().Str("originalMessageText", originalMessageText).Msg("got original message")
 					}
 				}
 			}
 		}
+	} else {
+		log.Debug().Msg("not a reply or no InReplyTo data")
 	}
 
 	// Remove the command prefix if present
@@ -1300,8 +1534,13 @@ func handleGorkCommand(ctx context.Context, ev *event.Event, matrixClient *mautr
 
 	var prompt string
 	if originalMessageText != "" {
-		// This is a reply to another message
-		prompt = fmt.Sprintf("%s\n\nThe user is asking about this message: \"%s\"\n\nTheir question/comment: %s", basePrompt, originalMessageText, targetText)
+		if targetText == "" {
+			// Only replied with @gork, no additional text - use original message directly
+			prompt = fmt.Sprintf("%s\n\n%s", basePrompt, originalMessageText)
+		} else {
+			// This is a reply with context - format as "question: original message"
+			prompt = fmt.Sprintf("%s\n\n%s: %s", basePrompt, targetText, originalMessageText)
+		}
 	} else {
 		// Direct message
 		prompt = fmt.Sprintf("%s\n\n%s", basePrompt, targetText)
@@ -1325,6 +1564,8 @@ func handleGorkCommand(ctx context.Context, ev *event.Event, matrixClient *mautr
 	if maxTokens == 0 {
 		maxTokens = 300 // default fallback
 	}
+
+	log.Debug().Str("originalMessageText", originalMessageText).Str("targetText", targetText).Str("prompt", prompt).Msg("sending to gork")
 
 	groqResp, err := groqClient.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 		Model: model,
