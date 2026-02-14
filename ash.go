@@ -698,7 +698,14 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 					} else if cmdCfg, ok := botCfg.Commands[cmd]; ok {
 						// Run bot command in a goroutine to avoid blocking other messages
 						go func() {
-							resp, err := FetchBotCommand(evCtx, &cmdCfg, cfg.LinkstashURL, ev, client, cfg.GroqAPIKey)
+							label := "> "
+							// Precedence: config.BOT_REPLY_LABEL -> bot.json label -> default
+							if cfg != nil && cfg.BotReplyLabel != "" {
+								label = cfg.BotReplyLabel
+							} else if botCfg != nil && botCfg.Label != "" {
+								label = botCfg.Label
+							}
+							resp, err := FetchBotCommand(evCtx, &cmdCfg, cfg.LinkstashURL, ev, client, cfg.GroqAPIKey, label)
 							var body string
 							if err != nil {
 								log.Error().Err(err).Str("cmd", cmd).Msg("failed to execute bot command")
@@ -709,13 +716,7 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 								// Command sent its own message (like images), don't send a text reply
 								return
 							}
-							label := "> "
-							// Precedence: config.BOT_REPLY_LABEL -> bot.json label -> default
-							if cfg != nil && cfg.BotReplyLabel != "" {
-								label = cfg.BotReplyLabel
-							} else if botCfg != nil && botCfg.Label != "" {
-								label = botCfg.Label
-							}
+
 							body = label + body
 							content := event.MessageEventContent{
 								MsgType:   event.MsgText,

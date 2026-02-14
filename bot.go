@@ -201,7 +201,7 @@ func detectImageExtension(inputPath string) string {
 }
 
 // FetchBotCommand executes the configured command and returns a string to post.
-func FetchBotCommand(ctx context.Context, c *BotCommand, linkstashURL string, ev *event.Event, matrixClient *mautrix.Client, groqAPIKey string) (string, error) {
+func FetchBotCommand(ctx context.Context, c *BotCommand, linkstashURL string, ev *event.Event, matrixClient *mautrix.Client, groqAPIKey string, replyLabel string) (string, error) {
 	if c.Response != "" {
 		return c.Response, nil
 	}
@@ -212,7 +212,7 @@ func FetchBotCommand(ctx context.Context, c *BotCommand, linkstashURL string, ev
 	case "exec":
 		return handleExecCommand(ctx, ev, matrixClient, c)
 	case "ai":
-		return handleAiCommand(ctx, ev, matrixClient, c, groqAPIKey)
+		return handleAiCommand(ctx, ev, matrixClient, c, groqAPIKey, replyLabel)
 	default:
 		return "", fmt.Errorf("unknown command type: %s", c.Type)
 	}
@@ -524,7 +524,7 @@ func handleExecCommand(ctx context.Context, ev *event.Event, matrixClient *mautr
 }
 
 // handleAiCommand handles AI-based commands using Groq
-func handleAiCommand(ctx context.Context, ev *event.Event, matrixClient *mautrix.Client, c *BotCommand, groqAPIKey string) (string, error) {
+func handleAiCommand(ctx context.Context, ev *event.Event, matrixClient *mautrix.Client, c *BotCommand, groqAPIKey string, replyLabel string) (string, error) {
 	var targetText string
 	// Track replied-to event ID if present so we can reply to the original
 	var originalEventID id.EventID
@@ -740,9 +740,15 @@ func handleAiCommand(ctx context.Context, ev *event.Event, matrixClient *mautrix
 	response := groqResp.Choices[0].Message.Content
 	// If we fetched a replied-to event earlier, send the response directly as a reply to that event
 	if originalEventID != "" {
+		// Prefix reply with the configured label (fallback to "> ")
+		label := replyLabel
+		if label == "" {
+			label = "> "
+		}
+		body := label + response
 		content := event.MessageEventContent{
 			MsgType:   event.MsgText,
-			Body:      response,
+			Body:      body,
 			RelatesTo: &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: originalEventID}},
 		}
 		_, err := matrixClient.SendMessageEvent(ctx, ev.RoomID, event.EventMessage, &content)
