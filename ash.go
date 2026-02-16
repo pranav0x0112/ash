@@ -553,40 +553,219 @@ func IsBlacklisted(url string, blacklist []*regexp.Regexp) bool {
 	return false
 }
 
-// getLogLevel reads the DEBUG flag from config.json to set the log level early
-func getLogLevel() zerolog.Level {
-	cfgPreview := struct {
-		Debug bool `json:"DEBUG"`
-	}{}
-	if f, err := os.Open("config.json"); err == nil {
-		defer f.Close()
-		_ = json.NewDecoder(f).Decode(&cfgPreview)
-		if cfgPreview.Debug {
-			return zerolog.DebugLevel
+// App holds the runtime dependencies for handling Matrix events.
+type App struct {
+	Cfg        *Config
+	MessagesDB *sql.DB
+	BotCfg     *BotConfig
+	Client     *mautrix.Client
+	ReadyChan  <-chan bool
+}
+
+// resolveReplyLabel returns the reply label with precedence:
+// config.BOT_REPLY_LABEL -> bot.json label -> default "> ".
+func resolveReplyLabel(cfg *Config, botCfg *BotConfig) string {
+	if cfg != nil && cfg.BotReplyLabel != "" {
+		return cfg.BotReplyLabel
+	}
+	if botCfg != nil && botCfg.Label != "" {
+		return botCfg.Label
+	}
+	return "> "
+}
+
+// sendBotReply sends a text reply to the given event.
+func sendBotReply(ctx context.Context, client *mautrix.Client, roomID id.RoomID, eventID id.EventID, body, cmd string) {
+	content := event.MessageEventContent{
+		MsgType:   event.MsgText,
+		Body:      body,
+		RelatesTo: &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: eventID}},
+	}
+	if _, err := client.SendMessageEvent(ctx, roomID, event.EventMessage, &content); err != nil {
+		log.Error().Err(err).Str("cmd", cmd).Msg("failed to send response")
+	} else {
+		log.Info().Str("cmd", cmd).Msg("sent bot response")
+	}
+}
+
+// handleMessage processes an incoming Matrix message event.
+func (app *App) handleMessage(evCtx context.Context, ev *event.Event) {
+	currentRoom, ok := app.findRoom(ev.RoomID)
+	if len(app.Cfg.RoomIDs) > 0 && !ok {
+		return
+	}
+
+	msgData, err := ProcessMessageEvent(ev)
+	if err != nil {
+		log.Warn().Err(err).Str("event_id", string(ev.ID)).Msg("failed to parse event")
+		return
+	}
+	if msgData == nil {
+		return
+	}
+	if err := StoreMessage(app.MessagesDB, msgData); err != nil {
+		log.Error().Err(err).Str("event_id", string(ev.ID)).Msg("store event")
+		return
+	}
+	log.Info().Str("room", currentRoom.Comment).Str("sender", string(ev.Sender)).Msg(truncate(msgData.Msg.Body, 100))
+
+	// Skip messages that contain the bot's own reply label.
+	if app.Cfg.BotReplyLabel != "" && strings.Contains(msgData.Msg.Body, app.Cfg.BotReplyLabel) {
+		log.Debug().Str("label", app.Cfg.BotReplyLabel).Msg("skipped bot processing due to bot reply label")
+		return
+	}
+
+	// Handle bot commands.
+	if currentRoom.AllowedCommands != nil && (strings.HasPrefix(msgData.Msg.Body, "/bot") || strings.HasPrefix(msgData.Msg.Body, "@gork")) {
+		app.dispatchBotCommand(evCtx, ev, msgData, currentRoom)
+		return
+	}
+
+	// Handle links.
+	app.processLinks(evCtx, ev, msgData, currentRoom)
+}
+
+// findRoom returns the RoomIDEntry matching the given room ID.
+func (app *App) findRoom(roomID id.RoomID) (RoomIDEntry, bool) {
+	for _, r := range app.Cfg.RoomIDs {
+		if string(roomID) == r.ID {
+			return r, true
 		}
 	}
-	return zerolog.InfoLevel
+	return RoomIDEntry{}, false
+}
+
+// dispatchBotCommand parses and dispatches a bot command.
+func (app *App) dispatchBotCommand(evCtx context.Context, ev *event.Event, msgData *MessageData, room RoomIDEntry) {
+	if app.Cfg.DryRun {
+		log.Info().Msg("dry run mode: skipping bot command")
+		return
+	}
+	select {
+	case <-app.ReadyChan:
+	case <-evCtx.Done():
+		return
+	}
+
+	normalizedBody := msgData.Msg.Body
+	if strings.HasPrefix(msgData.Msg.Body, "@gork") {
+		normalizedBody = "/bot gork " + strings.TrimSpace(strings.TrimPrefix(msgData.Msg.Body, "@gork"))
+	}
+	parts := strings.Fields(normalizedBody)
+	cmd := "hi"
+	if len(parts) >= 2 && parts[1] != "" {
+		cmd = parts[1]
+	}
+
+	label := resolveReplyLabel(app.Cfg, app.BotCfg)
+
+	// Check command permissions.
+	if len(room.AllowedCommands) > 0 && !inSlice(room.AllowedCommands, cmd) && cmd != "hi" {
+		sendBotReply(evCtx, app.Client, ev.RoomID, ev.ID, label+"command not allowed in this room", cmd)
+		return
+	}
+
+	if app.BotCfg == nil {
+		sendBotReply(evCtx, app.Client, ev.RoomID, ev.ID, label+"no bot configuration loaded", cmd)
+		return
+	}
+
+	if cmd == "help" {
+		sendBotReply(evCtx, app.Client, ev.RoomID, ev.ID, label+generateHelpMessage(app.BotCfg, room.AllowedCommands), cmd)
+		return
+	}
+
+	cmdCfg, ok := app.BotCfg.Commands[cmd]
+	if !ok {
+		sendBotReply(evCtx, app.Client, ev.RoomID, ev.ID, label+"Unknown command. "+generateHelpMessage(app.BotCfg, room.AllowedCommands), cmd)
+		return
+	}
+
+	// Run the command in a goroutine to avoid blocking other messages.
+	go func() {
+		resp, err := FetchBotCommand(evCtx, &cmdCfg, app.Cfg.LinkstashURL, ev, app.Client, app.Cfg.GroqAPIKey, label)
+		var body string
+		if err != nil {
+			log.Error().Err(err).Str("cmd", cmd).Msg("failed to execute bot command")
+			body = fmt.Sprintf("sorry, couldn't execute %s right now", cmd)
+		} else if resp != "" {
+			body = resp
+		} else {
+			return // Command sent its own message (like images).
+		}
+		sendBotReply(evCtx, app.Client, ev.RoomID, ev.ID, label+body, cmd)
+	}()
+}
+
+// processLinks handles link extraction, hooks, and snapshot exports.
+func (app *App) processLinks(_ context.Context, ev *event.Event, msgData *MessageData, room RoomIDEntry) {
+	if len(msgData.URLs) == 0 {
+		log.Debug().Msg("no links found")
+		return
+	}
+
+	log.Info().Int("count", len(msgData.URLs)).Msg("found links:")
+	for _, u := range msgData.URLs {
+		log.Info().Str("url", u).Msg("link")
+	}
+
+	if app.Cfg.OptOutTag != "" && strings.Contains(msgData.Msg.Body, app.Cfg.OptOutTag) {
+		log.Info().Str("tag", app.Cfg.OptOutTag).Msg("skipped sending hooks due to opt-out tag")
+	} else if app.Cfg.DryRun {
+		log.Info().Msg("dry run mode: skipping hooks")
+	} else {
+		blacklist, err := LoadBlacklist("blacklist.json")
+		if err != nil {
+			log.Error().Err(err).Msg("failed to load blacklist")
+		}
+		if room.Hook != "" {
+			for _, u := range msgData.URLs {
+				if blacklist != nil && IsBlacklisted(u, blacklist) {
+					log.Info().Str("url", u).Msg("skipped blacklisted url")
+					continue
+				}
+				go sendHook(room.Hook, u, room.Key, string(ev.Sender), room.ID, room.Comment, room.SendUser, room.SendTopic)
+			}
+		}
+	}
+
+	log.Info().Msg("stored to db, exporting snapshot...")
+	if err := ExportAllSnapshots(app.MessagesDB, app.Cfg.RoomIDs, app.Cfg.LinksPath); err != nil {
+		log.Error().Err(err).Msg("export snapshots")
+	} else {
+		log.Info().Str("path", app.Cfg.LinksPath).Msg("exported")
+	}
 }
 
 // main initializes the application, loads config, sets up databases, and starts the bot.
 func main() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
-	zerolog.SetGlobalLevel(getLogLevel())
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	log.Debug().Msg("starting")
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
 	cfg, err := LoadConfig()
 	must(err, "load config")
+	if cfg.Debug {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	}
 	log.Debug().Msg("config loaded")
+
 	metaDB, err := OpenMeta(ctx, cfg.MetaDBPath)
 	must(err, "open meta db")
 	defer metaDB.Close()
+
 	must(EnsureSecrets(ctx, metaDB, cfg), "ensure secrets")
+
 	messagesDB, err := OpenMessages(ctx, cfg.DBPath)
 	must(err, "open messages db")
 	defer messagesDB.Close()
+
 	_, err = EnsurePickleKey(ctx, metaDB)
 	must(err, "ensure pickle key")
+
 	must(run(ctx, metaDB, messagesDB, cfg), "run")
 	log.Debug().Msg("exiting")
 }
@@ -599,6 +778,7 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 		roomNames = append(roomNames, r.Comment)
 	}
 	log.Info().Msgf("ready: watching rooms: [%s]", strings.Join(roomNames, ", "))
+
 	client, err := LoadOrCreate(ctx, metaDB, cfg)
 	if err != nil {
 		return err
@@ -607,6 +787,7 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 	syncer := mautrix.NewDefaultSyncer()
 	client.Syncer = syncer
 	client.Store = &MetaSyncStore{DB: metaDB}
+
 	cryptoHelper, err := SetupHelper(ctx, client, metaDB, cfg.MetaDBPath)
 	if err != nil {
 		return err
@@ -615,7 +796,8 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 	if err := VerifyWithRecoveryKey(ctx, cryptoHelper.Machine(), cfg.RecoveryKey); err != nil {
 		log.Warn().Err(err).Msg("failed to verify session with recovery key")
 	}
-	// Load bot configuration (optional)
+
+	// Load bot configuration (optional).
 	botCfgPath := cfg.BotConfigPath
 	if botCfgPath == "" {
 		botCfgPath = "./bot.json"
@@ -626,178 +808,23 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 	} else {
 		log.Info().Str("path", botCfgPath).Msg("loaded bot config")
 	}
+
 	readyChan := make(chan bool)
 	var once sync.Once
-	syncCounter := 0
-	syncer.OnSync(func(syncCtx context.Context, resp *mautrix.RespSync, since string) bool {
+	syncer.OnSync(func(_ context.Context, _ *mautrix.RespSync, _ string) bool {
 		once.Do(func() { close(readyChan) })
-		syncCounter++
 		return true
 	})
-	handleMessage := func(evCtx context.Context, ev *event.Event) {
-		var currentRoom RoomIDEntry
-		if len(cfg.RoomIDs) > 0 {
-			found := false
-			for _, rid := range cfg.RoomIDs {
-				if string(ev.RoomID) == rid.ID {
-					currentRoom = rid
-					found = true
-					break
-				}
-			}
-			if !found {
-				return
-			}
-		}
-		msgData, err := ProcessMessageEvent(ev)
-		if err != nil {
-			log.Warn().Err(err).Str("event_id", string(ev.ID)).Msg("failed to parse event")
-			return
-		}
-		if msgData == nil {
-			return
-		}
-		if err := StoreMessage(messagesDB, msgData); err != nil {
-			log.Error().Err(err).Str("event_id", string(ev.ID)).Msg("store event")
-			return
-		}
-		log.Info().Str("room", currentRoom.Comment).Str("sender", string(ev.Sender)).Msg(truncate(msgData.Msg.Body, 100))
-		if cfg.BotReplyLabel != "" && strings.Contains(msgData.Msg.Body, cfg.BotReplyLabel) {
-			log.Debug().Str("label", cfg.BotReplyLabel).Msg("skipped bot processing due to bot reply label")
-			return
-		}
-		if currentRoom.AllowedCommands != nil && (strings.HasPrefix(msgData.Msg.Body, "/bot") || strings.HasPrefix(msgData.Msg.Body, "@gork")) {
-			if cfg.DryRun {
-				log.Info().Msg("dry run mode: skipping bot command")
-				return
-			}
-			select {
-			case <-readyChan:
-			case <-evCtx.Done():
-				return
-			}
-			normalizedBody := msgData.Msg.Body
-			if strings.HasPrefix(msgData.Msg.Body, "@gork") {
-				normalizedBody = "/bot gork " + strings.TrimSpace(strings.TrimPrefix(msgData.Msg.Body, "@gork"))
-			}
-			parts := strings.Fields(normalizedBody)
-			cmd := ""
-			if len(parts) >= 2 {
-				cmd = parts[1]
-			}
-			if cmd == "" || cmd == "hi" {
-				cmd = "hi"
-			}
-			var body string
-			if len(currentRoom.AllowedCommands) > 0 && !inSlice(currentRoom.AllowedCommands, cmd) && cmd != "hi" {
-				body = "command not allowed in this room"
-			} else {
-				if botCfg != nil {
-					if cmd == "help" {
-						body = generateHelpMessage(botCfg, currentRoom.AllowedCommands)
-					} else if cmdCfg, ok := botCfg.Commands[cmd]; ok {
-						// Run bot command in a goroutine to avoid blocking other messages
-						go func() {
-							label := "> "
-							// Precedence: config.BOT_REPLY_LABEL -> bot.json label -> default
-							if cfg != nil && cfg.BotReplyLabel != "" {
-								label = cfg.BotReplyLabel
-							} else if botCfg != nil && botCfg.Label != "" {
-								label = botCfg.Label
-							}
-							resp, err := FetchBotCommand(evCtx, &cmdCfg, cfg.LinkstashURL, ev, client, cfg.GroqAPIKey, label)
-							var body string
-							if err != nil {
-								log.Error().Err(err).Str("cmd", cmd).Msg("failed to execute bot command")
-								body = fmt.Sprintf("sorry, couldn't execute %s right now", cmd)
-							} else if resp != "" {
-								body = resp
-							} else {
-								// Command sent its own message (like images), don't send a text reply
-								return
-							}
 
-							body = label + body
-							content := event.MessageEventContent{
-								MsgType:   event.MsgText,
-								Body:      body,
-								RelatesTo: &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: ev.ID}},
-							}
-							_, err = client.SendMessageEvent(evCtx, ev.RoomID, event.EventMessage, &content)
-							if err != nil {
-								log.Error().Err(err).Msg("failed to send response")
-							} else {
-								log.Info().Str("cmd", cmd).Msg("sent bot response")
-							}
-						}()
-						return // Don't send a response here, it's handled in the goroutine
-					} else {
-						body = "Unknown command. " + generateHelpMessage(botCfg, currentRoom.AllowedCommands)
-					}
-				} else {
-					body = "no bot configuration loaded"
-				}
-			}
-			label := "> "
-			// Precedence: config.BOT_REPLY_LABEL -> bot.json label -> default
-			if cfg != nil && cfg.BotReplyLabel != "" {
-				label = cfg.BotReplyLabel
-			} else if botCfg != nil && botCfg.Label != "" {
-				label = botCfg.Label
-			}
-			body = label + body
-			content := event.MessageEventContent{
-				MsgType:   event.MsgText,
-				Body:      body,
-				RelatesTo: &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: ev.ID}},
-			}
-			_, err := client.SendMessageEvent(evCtx, ev.RoomID, event.EventMessage, &content)
-			if err != nil {
-				log.Error().Err(err).Msg("failed to send response")
-			} else {
-				log.Info().Str("cmd", cmd).Msg("sent bot response")
-			}
-			return
-		}
-		if len(msgData.URLs) == 0 {
-			log.Debug().Msg("no links found")
-		} else {
-			log.Info().Int("count", len(msgData.URLs)).Msg("found links:")
-			for _, u := range msgData.URLs {
-				log.Info().Str("url", u).Msg("link")
-			}
-			if cfg.OptOutTag != "" && strings.Contains(msgData.Msg.Body, cfg.OptOutTag) {
-				log.Info().Str("tag", cfg.OptOutTag).Msg("skipped sending hooks due to opt-out tag")
-			} else {
-				if cfg.DryRun {
-					log.Info().Msg("dry run mode: skipping hooks")
-				} else {
-					blacklist, err := LoadBlacklist("blacklist.json")
-					if err != nil {
-						log.Error().Err(err).Msg("failed to load blacklist")
-					}
-					if currentRoom.Hook != "" {
-						for _, u := range msgData.URLs {
-							if blacklist != nil && IsBlacklisted(u, blacklist) {
-								log.Info().Str("url", u).Msg("skipped blacklisted url")
-								continue
-							}
-							go sendHook(currentRoom.Hook, u, currentRoom.Key, string(ev.Sender), currentRoom.ID, currentRoom.Comment, currentRoom.SendUser, currentRoom.SendTopic)
-						}
-					}
-				}
-			}
-		}
-		if len(msgData.URLs) > 0 {
-			log.Info().Msg("stored to db, exporting snapshot...")
-			if err := ExportAllSnapshots(messagesDB, cfg.RoomIDs, cfg.LinksPath); err != nil {
-				log.Error().Err(err).Msg("export snapshots")
-			} else {
-				log.Info().Str("path", cfg.LinksPath).Msg("exported")
-			}
-		}
+	app := &App{
+		Cfg:        cfg,
+		MessagesDB: messagesDB,
+		BotCfg:     botCfg,
+		Client:     client,
+		ReadyChan:  readyChan,
 	}
-	syncer.OnEventType(event.EventMessage, handleMessage)
+	syncer.OnEventType(event.EventMessage, app.handleMessage)
+
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -809,6 +836,7 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 			log.Error().Err(err).Msg("sync error")
 		}
 	}()
+
 	select {
 	case <-readyChan:
 	case <-ctx.Done():
@@ -818,6 +846,10 @@ func run(ctx context.Context, metaDB *sql.DB, messagesDB *sql.DB, cfg *Config) e
 	log.Debug().Msg("exiting run")
 	return ctx.Err()
 }
+
+// ---------------------------------------------------------------------------
+// Utility helpers
+// ---------------------------------------------------------------------------
 
 func inSlice(slice []string, item string) bool {
 	for _, s := range slice {
@@ -834,6 +866,7 @@ func truncate(s string, maxLen int) string {
 	}
 	return s[:maxLen] + "..."
 }
+
 func must(err error, context string) {
 	if err != nil {
 		log.Fatal().Err(err).Msgf("%s", context)

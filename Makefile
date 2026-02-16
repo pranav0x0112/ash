@@ -37,7 +37,7 @@ docker-build: ## Build using Docker for cross-compilation to Ubuntu
 	docker run --rm -v $(PWD):/host ash cp /usr/local/bin/ash /host/ash-linux-amd64
 
 # Pull configuration
-RSYNC_OPTS ?= -avzP --delete
+RSYNC_OPTS ?= -avzhP --delete
 PULL_SRC ?= ark:ash/data/
 
 pull: ## Pull the remote 'data' directory into local ./data/ (overwrites). Set PULL_SRC to change source.
